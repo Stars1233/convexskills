@@ -1,516 +1,220 @@
 ---
 name: convex-agents
-displayName: Convex Agents
-description: Building AI agents with the Convex Agent component including thread management, tool integration, streaming responses, RAG patterns, and workflow orchestration
-version: 1.0.0
-author: Convex
-tags: [convex, agents, ai, llm, tools, rag, workflows]
+description: Builds AI agents on the Convex agent component: threads, messages, tools that call queries and mutations, streaming, RAG with vector search, and workflows for multi step jobs. Use when adding a chat assistant, tool calling agent, or retrieval feature to a Convex app.
 ---
 
-# Convex Agents
+# Convex agents
 
-Build persistent, stateful AI agents with Convex including thread management, tool integration, streaming responses, RAG patterns, and workflow orchestration.
+Produces a chat or tool calling agent backed by `@convex-dev/agent`, with thread history stored in Convex and a reactive message list for the UI. The one rule: every LLM call runs inside an action. Mutations save the prompt and schedule the action; they never call a model.
 
-## Documentation Sources
+## When to reach for this
 
-Before implementing, do not assume; fetch the latest documentation:
+- Adding a chat assistant with persistent conversation history
+- Letting an LLM call your queries and mutations as tools
+- Streaming a model reply to one or more clients
+- Answering questions over your own documents (RAG)
+- Chaining several LLM steps into a durable job that survives restarts
 
-- Primary: https://docs.convex.dev/ai
-- Convex Agent Component: https://www.npmjs.com/package/@convex-dev/agent
-- For broader context: https://docs.convex.dev/llms.txt
-
-## Instructions
-
-### Why Convex for AI Agents
-
-- **Persistent State** - Conversation history survives restarts
-- **Real-time Updates** - Stream responses to clients automatically
-- **Tool Execution** - Run Convex functions as agent tools
-- **Durable Workflows** - Long-running agent tasks with reliability
-- **Built-in RAG** - Vector search for knowledge retrieval
-
-### Setting Up Convex Agent
+## Install and register
 
 ```bash
-npm install @convex-dev/agent ai openai
+npm install @convex-dev/agent ai @ai-sdk/openai zod
+npx convex env set OPENAI_API_KEY sk-...
 ```
+
+```typescript
+// convex/convex.config.ts
+import { defineApp } from "convex/server";
+import agent from "@convex-dev/agent/convex.config";
+
+const app = defineApp();
+app.use(agent);
+export default app;
+```
+
+Run `npx convex dev` once so `components.agent` is generated before defining an agent.
+
+## Define an agent
 
 ```typescript
 // convex/agent.ts
-import { Agent } from "@convex-dev/agent";
+import { Agent, stepCountIs } from "@convex-dev/agent";
+import { openai } from "@ai-sdk/openai";
 import { components } from "./_generated/api";
-import { OpenAI } from "openai";
 
-const openai = new OpenAI();
-
-export const agent = new Agent(components.agent, {
-  chat: openai.chat,
-  textEmbedding: openai.embeddings,
+export const supportAgent = new Agent(components.agent, {
+  name: "Support Agent",
+  languageModel: openai.chat("gpt-4o-mini"),
+  instructions: "You are a support assistant. Answer briefly and cite docs when possible.",
+  // Lets the model call tools and then respond, up to 5 steps
+  stopWhen: stepCountIs(5),
 });
 ```
 
-### Thread Management
+`name` tags each saved message with the agent that wrote it. Everything except `name` can be overridden per call.
+
+## Create a thread and generate a reply
+
+Save the user prompt in a mutation, then schedule an internal action that generates the reply. Clients subscribed to the thread see the new message without the action returning anything.
 
 ```typescript
-// convex/threads.ts
-import { mutation, query } from "./_generated/server";
+// convex/chat.ts
 import { v } from "convex/values";
-import { agent } from "./agent";
+import { mutation, internalAction, QueryCtx, MutationCtx } from "./_generated/server";
+import { components, internal } from "./_generated/api";
+import { saveMessage } from "@convex-dev/agent";
+import { supportAgent } from "./agent";
 
-// Create a new conversation thread
-export const createThread = mutation({
-  args: {
-    userId: v.id("users"),
-    title: v.optional(v.string()),
-  },
-  returns: v.id("threads"),
-  handler: async (ctx, args) => {
-    const threadId = await agent.createThread(ctx, {
-      userId: args.userId,
-      metadata: {
-        title: args.title ?? "New Conversation",
-        createdAt: Date.now(),
-      },
-    });
+// Throws unless the signed in user owns the thread
+async function authorizeThreadAccess(ctx: QueryCtx | MutationCtx, threadId: string) {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) throw new Error("Not authenticated");
+  const thread = await ctx.runQuery(components.agent.threads.getThread, { threadId });
+  if (!thread || thread.userId !== identity.subject) throw new Error("Unauthorized");
+}
+
+export const startThread = mutation({
+  args: {},
+  returns: v.string(),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("Not authenticated");
+    const { threadId } = await supportAgent.createThread(ctx, { userId: identity.subject });
     return threadId;
   },
 });
 
-// List user's threads
-export const listThreads = query({
-  args: { userId: v.id("users") },
-  returns: v.array(v.object({
-    _id: v.id("threads"),
-    title: v.string(),
-    lastMessageAt: v.optional(v.number()),
-  })),
-  handler: async (ctx, args) => {
-    return await agent.listThreads(ctx, {
-      userId: args.userId,
-    });
-  },
-});
-
-// Get thread messages
-export const getMessages = query({
-  args: { threadId: v.id("threads") },
-  returns: v.array(v.object({
-    role: v.string(),
-    content: v.string(),
-    createdAt: v.number(),
-  })),
-  handler: async (ctx, args) => {
-    return await agent.getMessages(ctx, {
-      threadId: args.threadId,
-    });
-  },
-});
-```
-
-### Sending Messages and Streaming Responses
-
-```typescript
-// convex/chat.ts
-import { action } from "./_generated/server";
-import { v } from "convex/values";
-import { agent } from "./agent";
-import { internal } from "./_generated/api";
-
-export const sendMessage = action({
-  args: {
-    threadId: v.id("threads"),
-    message: v.string(),
-  },
+export const sendMessage = mutation({
+  args: { threadId: v.string(), prompt: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {
-    // Add user message to thread
-    await ctx.runMutation(internal.chat.addUserMessage, {
+    await authorizeThreadAccess(ctx, args.threadId);
+    const { messageId } = await saveMessage(ctx, components.agent, {
       threadId: args.threadId,
-      content: args.message,
+      prompt: args.prompt,
     });
-
-    // Generate AI response with streaming
-    const response = await agent.chat(ctx, {
+    await ctx.scheduler.runAfter(0, internal.chat.generateReply, {
       threadId: args.threadId,
-      messages: [{ role: "user", content: args.message }],
-      stream: true,
-      onToken: async (token) => {
-        // Stream tokens to client via mutation
-        await ctx.runMutation(internal.chat.appendToken, {
-          threadId: args.threadId,
-          token,
-        });
-      },
+      promptMessageId: messageId,
     });
+    return null;
+  },
+});
 
-    // Save complete response
-    await ctx.runMutation(internal.chat.saveResponse, {
-      threadId: args.threadId,
-      content: response.content,
-    });
-
+export const generateReply = internalAction({
+  args: { threadId: v.string(), promptMessageId: v.string() },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    // promptMessageId makes retries safe: the same prompt is reused, never duplicated
+    await supportAgent.generateText(
+      ctx,
+      { threadId: args.threadId },
+      { promptMessageId: args.promptMessageId },
+    );
     return null;
   },
 });
 ```
 
-### Tool Integration
+Thread ids are strings, not `v.id(...)`, since the table lives inside the component.
 
-Define tools that agents can use:
+## List messages for the UI
 
 ```typescript
-// convex/tools.ts
-import { tool } from "@convex-dev/agent";
-import { v } from "convex/values";
-import { api } from "./_generated/api";
+// convex/chat.ts (continued)
+import { paginationOptsValidator } from "convex/server";
+import { listUIMessages } from "@convex-dev/agent";
+import { query } from "./_generated/server";
 
-// Tool to search knowledge base
-export const searchKnowledge = tool({
-  name: "search_knowledge",
-  description: "Search the knowledge base for relevant information",
-  parameters: v.object({
-    query: v.string(),
-    limit: v.optional(v.number()),
-  }),
+export const listMessages = query({
+  args: { threadId: v.string(), paginationOpts: paginationOptsValidator },
   handler: async (ctx, args) => {
-    const results = await ctx.runQuery(api.knowledge.search, {
-      query: args.query,
-      limit: args.limit ?? 5,
-    });
-    return results;
-  },
-});
-
-// Tool to create a task
-export const createTask = tool({
-  name: "create_task",
-  description: "Create a new task for the user",
-  parameters: v.object({
-    title: v.string(),
-    description: v.optional(v.string()),
-    dueDate: v.optional(v.string()),
-  }),
-  handler: async (ctx, args) => {
-    const taskId = await ctx.runMutation(api.tasks.create, {
-      title: args.title,
-      description: args.description,
-      dueDate: args.dueDate ? new Date(args.dueDate).getTime() : undefined,
-    });
-    return { success: true, taskId };
-  },
-});
-
-// Tool to get weather
-export const getWeather = tool({
-  name: "get_weather",
-  description: "Get current weather for a location",
-  parameters: v.object({
-    location: v.string(),
-  }),
-  handler: async (ctx, args) => {
-    const response = await fetch(
-      `https://api.weather.com/current?location=${encodeURIComponent(args.location)}`
-    );
-    return await response.json();
+    await authorizeThreadAccess(ctx, args.threadId);
+    return await listUIMessages(ctx, components.agent, args);
   },
 });
 ```
 
-### Agent with Tools
-
-```typescript
-// convex/assistant.ts
-import { action } from "./_generated/server";
-import { v } from "convex/values";
-import { agent } from "./agent";
-import { searchKnowledge, createTask, getWeather } from "./tools";
-
-export const chat = action({
-  args: {
-    threadId: v.id("threads"),
-    message: v.string(),
-  },
-  returns: v.string(),
-  handler: async (ctx, args) => {
-    const response = await agent.chat(ctx, {
-      threadId: args.threadId,
-      messages: [{ role: "user", content: args.message }],
-      tools: [searchKnowledge, createTask, getWeather],
-      systemPrompt: `You are a helpful assistant. You have access to tools to:
-        - Search the knowledge base for information
-        - Create tasks for the user
-        - Get weather information
-        Use these tools when appropriate to help the user.`,
-    });
-
-    return response.content;
-  },
-});
-```
-
-### RAG (Retrieval Augmented Generation)
-
-```typescript
-// convex/knowledge.ts
-import { mutation, query } from "./_generated/server";
-import { v } from "convex/values";
-import { agent } from "./agent";
-
-// Add document to knowledge base
-export const addDocument = mutation({
-  args: {
-    title: v.string(),
-    content: v.string(),
-    metadata: v.optional(v.object({
-      source: v.optional(v.string()),
-      category: v.optional(v.string()),
-    })),
-  },
-  returns: v.id("documents"),
-  handler: async (ctx, args) => {
-    // Generate embedding
-    const embedding = await agent.embed(ctx, args.content);
-
-    return await ctx.db.insert("documents", {
-      title: args.title,
-      content: args.content,
-      embedding,
-      metadata: args.metadata ?? {},
-      createdAt: Date.now(),
-    });
-  },
-});
-
-// Search knowledge base
-export const search = query({
-  args: {
-    query: v.string(),
-    limit: v.optional(v.number()),
-  },
-  returns: v.array(v.object({
-    _id: v.id("documents"),
-    title: v.string(),
-    content: v.string(),
-    score: v.number(),
-  })),
-  handler: async (ctx, args) => {
-    const results = await agent.search(ctx, {
-      query: args.query,
-      table: "documents",
-      limit: args.limit ?? 5,
-    });
-
-    return results.map((r) => ({
-      _id: r._id,
-      title: r.title,
-      content: r.content,
-      score: r._score,
-    }));
-  },
-});
-```
-
-### Workflow Orchestration
-
-```typescript
-// convex/workflows.ts
-import { action, internalMutation } from "./_generated/server";
-import { v } from "convex/values";
-import { agent } from "./agent";
-import { internal } from "./_generated/api";
-
-// Multi-step research workflow
-export const researchTopic = action({
-  args: {
-    topic: v.string(),
-    userId: v.id("users"),
-  },
-  returns: v.id("research"),
-  handler: async (ctx, args) => {
-    // Create research record
-    const researchId = await ctx.runMutation(internal.workflows.createResearch, {
-      topic: args.topic,
-      userId: args.userId,
-      status: "searching",
-    });
-
-    // Step 1: Search for relevant documents
-    const searchResults = await agent.search(ctx, {
-      query: args.topic,
-      table: "documents",
-      limit: 10,
-    });
-
-    await ctx.runMutation(internal.workflows.updateStatus, {
-      researchId,
-      status: "analyzing",
-    });
-
-    // Step 2: Analyze and synthesize
-    const analysis = await agent.chat(ctx, {
-      messages: [{
-        role: "user",
-        content: `Analyze these sources about "${args.topic}" and provide a comprehensive summary:\n\n${
-          searchResults.map((r) => r.content).join("\n\n---\n\n")
-        }`,
-      }],
-      systemPrompt: "You are a research assistant. Provide thorough, well-cited analysis.",
-    });
-
-    // Step 3: Generate key insights
-    await ctx.runMutation(internal.workflows.updateStatus, {
-      researchId,
-      status: "summarizing",
-    });
-
-    const insights = await agent.chat(ctx, {
-      messages: [{
-        role: "user",
-        content: `Based on this analysis, list 5 key insights:\n\n${analysis.content}`,
-      }],
-    });
-
-    // Save final results
-    await ctx.runMutation(internal.workflows.completeResearch, {
-      researchId,
-      analysis: analysis.content,
-      insights: insights.content,
-      sources: searchResults.map((r) => r._id),
-    });
-
-    return researchId;
-  },
-});
-```
-
-## Examples
-
-### Complete Chat Application Schema
-
-```typescript
-// convex/schema.ts
-import { defineSchema, defineTable } from "convex/server";
-import { v } from "convex/values";
-
-export default defineSchema({
-  threads: defineTable({
-    userId: v.id("users"),
-    title: v.string(),
-    lastMessageAt: v.optional(v.number()),
-    metadata: v.optional(v.any()),
-  }).index("by_user", ["userId"]),
-
-  messages: defineTable({
-    threadId: v.id("threads"),
-    role: v.union(v.literal("user"), v.literal("assistant"), v.literal("system")),
-    content: v.string(),
-    toolCalls: v.optional(v.array(v.object({
-      name: v.string(),
-      arguments: v.any(),
-      result: v.optional(v.any()),
-    }))),
-    createdAt: v.number(),
-  }).index("by_thread", ["threadId"]),
-
-  documents: defineTable({
-    title: v.string(),
-    content: v.string(),
-    embedding: v.array(v.float64()),
-    metadata: v.object({
-      source: v.optional(v.string()),
-      category: v.optional(v.string()),
-    }),
-    createdAt: v.number(),
-  }).vectorIndex("by_embedding", {
-    vectorField: "embedding",
-    dimensions: 1536,
-  }),
-});
-```
-
-### React Chat Component
-
-```typescript
-import { useQuery, useMutation, useAction } from "convex/react";
+```tsx
+// src/Chat.tsx
+import { useUIMessages } from "@convex-dev/agent/react";
 import { api } from "../convex/_generated/api";
-import { useState, useRef, useEffect } from "react";
 
-function ChatInterface({ threadId }: { threadId: Id<"threads"> }) {
-  const messages = useQuery(api.threads.getMessages, { threadId });
-  const sendMessage = useAction(api.chat.sendMessage);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
-
-  const handleSend = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || sending) return;
-
-    const message = input.trim();
-    setInput("");
-    setSending(true);
-
-    try {
-      await sendMessage({ threadId, message });
-    } finally {
-      setSending(false);
-    }
-  };
-
+function Chat({ threadId }: { threadId: string }) {
+  const { results, status, loadMore } = useUIMessages(
+    api.chat.listMessages,
+    { threadId },
+    { initialNumItems: 20 },
+  );
   return (
-    <div className="chat-container">
-      <div className="messages">
-        {messages?.map((msg, i) => (
-          <div key={i} className={`message ${msg.role}`}>
-            <strong>{msg.role === "user" ? "You" : "Assistant"}:</strong>
-            <p>{msg.content}</p>
-          </div>
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
-
-      <form onSubmit={handleSend} className="input-form">
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="Type your message..."
-          disabled={sending}
-        />
-        <button type="submit" disabled={sending || !input.trim()}>
-          {sending ? "Sending..." : "Send"}
-        </button>
-      </form>
+    <div>
+      {results.map((m) => (
+        <div key={m.key} data-role={m.role}>{m.text}</div>
+      ))}
+      {status === "CanLoadMore" && <button onClick={() => loadMore(20)}>Older</button>}
     </div>
   );
 }
 ```
 
-## Best Practices
+`listUIMessages` merges tool calls and the assistant text that follows them into one `UIMessage`, which keeps rendering simple.
 
-- Never run `npx convex deploy` unless explicitly instructed
-- Never run any git commands unless explicitly instructed
-- Store conversation history in Convex for persistence
-- Use streaming for better user experience with long responses
-- Implement proper error handling for tool failures
-- Use vector indexes for efficient RAG retrieval
-- Rate limit agent interactions to control costs
-- Log tool usage for debugging and analytics
+## One tool
 
-## Common Pitfalls
+Tools are defined with `createTool` and get a `ctx` that includes `runQuery`, `runMutation`, `userId`, and `threadId`. Annotate the handler return type to avoid circular type errors.
 
-1. **Not persisting threads** - Conversations lost on refresh
-2. **Blocking on long responses** - Use streaming instead
-3. **Tool errors crashing agents** - Add proper error handling
-4. **Large context windows** - Summarize old messages
-5. **Missing embeddings for RAG** - Generate embeddings on insert
+```typescript
+// convex/tools.ts
+import { createTool } from "@convex-dev/agent";
+import { z } from "zod";
+import { api } from "./_generated/api";
 
-## References
+export const searchOrders = createTool({
+  description: "Find the current user's orders that match a search term",
+  args: z.object({
+    term: z.string().describe("Product name or order number to look for"),
+  }),
+  handler: async (ctx, args): Promise<Array<{ id: string; status: string }>> => {
+    return await ctx.runQuery(api.orders.search, { term: args.term });
+  },
+});
+```
 
-- Convex Documentation: https://docs.convex.dev/
-- Convex LLMs.txt: https://docs.convex.dev/llms.txt
-- Convex AI: https://docs.convex.dev/ai
-- Agent Component: https://www.npmjs.com/package/@convex-dev/agent
+Pass it to the agent with `tools: { searchOrders }` in the constructor or at the call site. For tool error handling, runtime tools with closures, and delta streaming to the client, open [references/tools-and-streaming.md](references/tools-and-streaming.md).
+
+## Retrieval and multi step jobs
+
+For embedding documents, searching them with `@convex-dev/rag` or a hand rolled vector index, injecting results into the prompt, and running several LLM steps as a durable `@convex-dev/workflow` job, open [references/rag-and-workflows.md](references/rag-and-workflows.md).
+
+## Common mistakes
+
+| Mistake | Why it breaks | Do instead |
+| --- | --- | --- |
+| Calling `generateText` in a mutation | Mutations cannot make network calls and must be deterministic | Save the prompt with `saveMessage`, schedule an `internalAction` |
+| `v.id("threads")` for thread ids | The threads table lives in the component, so ids are strings outside it | Use `v.string()` |
+| Skipping `npx convex dev` after `app.use(agent)` | `components.agent` is not generated, so types fail | Run dev once before writing agent code |
+| Returning the reply text from the action to the client | Loses the reply if the client disconnects, no reactivity | Let clients read `listUIMessages`; the saved message shows up on its own |
+| Tools without `.describe()` on args | The model guesses what each field means and calls tools badly | Describe every zod field |
+| Tool handler with no return type annotation | TypeScript circularity errors from `ctx.runQuery` | Add `: Promise<...>` to the handler |
+| Exposing the message query with no auth check | Any client can read any thread | Call an `authorizeThreadAccess` helper first |
+| `stopWhen` left at the default with tools defined | The model calls a tool and stops without a text reply | Set `stopWhen: stepCountIs(n)` with `n > 1` |
+
+## Checklist
+
+- [ ] `app.use(agent)` in `convex.config.ts` and `npx convex dev` has run
+- [ ] Provider key stored with `npx convex env set`, never in client code
+- [ ] `Agent` has a `name`, `languageModel`, and `instructions`
+- [ ] Prompts saved in a mutation, replies generated in an `internalAction` with `promptMessageId`
+- [ ] Thread and message ids typed as `v.string()`
+- [ ] Message list query checks thread ownership before calling `listUIMessages`
+- [ ] Every tool arg has a zod `.describe()` and the handler has a return type
+- [ ] `stopWhen: stepCountIs(n)` set when tools are in play
+- [ ] Client uses `useUIMessages` rather than reading action return values
+
+## Docs
+
+- https://docs.convex.dev/llms.txt
+- https://docs.convex.dev/agents
+- https://docs.convex.dev/agents/agent-usage
+- https://docs.convex.dev/agents/tools
+- https://www.convex.dev/components/agent

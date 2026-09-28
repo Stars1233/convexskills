@@ -1,59 +1,33 @@
-# Claude Code Skills Templates
+# Skill templates
 
-These are template skills for Claude Code (claude.ai/code). Copy them to your project's `.claude/skills/` directory and customize as needed.
+Two starter skills you are meant to edit. They carry house style, so they live here as templates instead of in `skills/` where the shared, unedited skills are.
 
-## Installation
+| Template | What it is for |
+| --- | --- |
+| `dev/SKILL.md` | Stack, Convex mutation rules, design system, docs habit, communication style |
+| `help/SKILL.md` | Root cause first, confidence bar, scope rules, what not to touch |
 
-1. Create the skills directory in your project:
+The git rules that used to live here are now a real skill, `git-safety`, installed with everything else.
+
+## Install
 
 ```bash
-mkdir -p .claude/skills
+npx @waynesutton/builder-skills install-templates
 ```
 
-2. Copy the skills you want:
+That copies both folders into `.claude/skills/`, plus `AGENTS.md`, `files.md`, `changelog.md`, `task.md`, and `prds/lessons.md` at the project root. Existing files are never overwritten.
+
+For Codex or Cursor, copy the folders to `.codex/skills/` or `.cursor/skills/` instead:
 
 ```bash
-cp templates/skills/dev.md .claude/skills/
-cp templates/skills/help.md .claude/skills/
-cp templates/skills/gitrules.md .claude/skills/
+cp -r node_modules/@waynesutton/builder-skills/templates/skills/dev .agents/skills/
+cp -r node_modules/@waynesutton/builder-skills/templates/skills/help .agents/skills/
 ```
 
-3. Customize each skill for your project's needs.
+## Then edit
 
-## Available Templates
+Open each `SKILL.md` and replace the bracketed parts: auth provider, email provider, palette, confidence bar, protected areas. Rewrite the `description` so it says what this project's version does. Keep `name` matching the folder.
 
-| Template | Purpose |
-|----------|---------|
-| `dev.md` | Full-stack Convex development practices and coding standards |
-| `help.md` | Problem-solving methodology and change management guidelines |
-| `gitrules.md` | Git safety protocols to prevent accidental data loss |
+## Format
 
-## Customization Tips
-
-**dev.md**
-- Add your specific tech stack
-- Include project-specific documentation links
-- Add custom coding conventions
-
-**help.md**
-- Adjust the confidence threshold (default 98%)
-- Add project-specific change restrictions
-- Include team-specific documentation policies
-
-**gitrules.md**
-- Generally keep as-is (safety rules are universal)
-- Add project-specific branch protection rules if needed
-
-## Usage with Claude Code
-
-Once installed, Claude Code will automatically use these skills when working in your project. You can also reference them explicitly:
-
-```
-Use the dev skill for this task
-Follow gitrules before any git operation
-```
-
-## References
-
-- Claude Code documentation: https://docs.anthropic.com/en/docs/claude-code
-- Convex documentation: https://docs.convex.dev/
+Each skill is a folder with a `SKILL.md`. Frontmatter is `name` and `description` only. Claude Code, Codex, Cursor, and OpenCode all read this layout. Flat `.md` files in a skills folder are not picked up anymore.

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-16
+
+Renamed from `@waynesutton/convex-skills` to `@waynesutton/builder-skills`. Convex now ships official skills at get-convex/convex-agent-plugins, so this set is named for who it serves. Every skill was rewritten against the current Anthropic and OpenAI skill authoring guidance.
+
+### Added
+
+- `project-workflow` skill: triage, PRD in `prds/`, `task.md` tracking, docs sync, `prds/lessons.md` loop. Ships `references/prd-template.md`.
+- `project-docs` skill: syncs `task.md`, `changelog.md`, `files.md` from git evidence. Convex feature detection rules (a component counts only if `convex.config.ts` registers it) and a redaction pass borrowed from get-convex/convex-hackathon-skill. Ships `references/evidence-rules.md` and `references/convex-detection.md`.
+- `git-safety` skill, replacing the `gitrules.md` template. Approval table for destructive commands, "undo means edit" rule, diff before discard.
+- `references/` folders for `convex-http-actions`, `convex-migrations`, `convex-cron-jobs`, `convex-security-audit`, `convex-agents`, `convex-best-practices`. Deep material loads on demand instead of in every prompt.
+- `.claude-plugin/marketplace.json` so `claude plugins marketplace add waynesutton/builder-skills` works.
+- `scripts/check-skills.mjs` and `npm run check`. Verifies frontmatter shape, name matches folder, line budgets, linked references, banned words, stale name references, and that `bin/cli.js`, `index.js`, and `plugin.json` agree with `skills/`. Runs on `prepublishOnly`.
+- Templates: `AGENTS.md`, `files.md`, `changelog.md`, `task.md`, `prds/lessons.md` starters. `dev` and `help` now ship as skill folders.
+- CLI: `install` takes multiple skills, `--target cursor` and `--target opencode` aliases, `install-templates` symlinks `CLAUDE.md` to `AGENTS.md`.
+- `index.js`: `getSkillDir()` and `getSkillMeta()`.
+- `prds/` and `task.md` are tracked in git. Finished PRDs moved to `prds/archive/`, `convex-skills-updates-plan.md` renamed `builder-skills-updates-plan.md`. `prds/lessons.md` added.
+
+### Changed
+
+- Package name `@waynesutton/builder-skills`, binary `builder-skills`, plugin `builder-skills`, repo `waynesutton/builder-skills`. Author is Wayne Sutton in every manifest.
+- All 14 existing `SKILL.md` files: frontmatter is `name` and `description` only. Descriptions are third person with a `Use when` trigger. Bodies under 300 lines. Boilerplate ESLint and documentation source blocks removed.
+- `convex` skill rewritten as a router for all 17 skills.
+- CLI `install` copies the whole skill folder so `references/` and `agents/openai.yaml` travel with `SKILL.md`. `--link` symlinks the folder.
+- `README.md` rewritten: badge, three install paths, why the skills exist, skills table, how a skill is built.
+- `AGENTS.md` cut from 206 to under 80 lines. `CLAUDE.md` still symlinks to it.
+- `command/convex.md` is now a routing table for all 17 skills.
+- `GEMINI.md`, `.codex/README.md`, `CONTRIBUTING.md`, `docs.md` rewritten for the new name and structure.
+- `.gitignore` ignores `.agents/` and no longer ignores `prds/` or `task.md`.
+
+### Removed
+
+- `templates/CLAUDE.md`. `install-templates` links `CLAUDE.md` to `AGENTS.md` instead.
+- `templates/skills/dev.md`, `help.md`, `gitrules.md` flat files. Claude Code no longer reads flat skill files.
+- `displayName`, `version`, `author`, `tags` frontmatter keys from every skill.
+- The unofficial pointer text from `package.json` description. The README carries it instead.
+
+### Fixed
+
+- `bin/cli.js` and `index.js` listed 12 skills while `skills/` held 14. Now 17 and checked by script.
+- `.claude-plugin/plugin.json` claimed author Convex and repo get-convex/skills.
+- `CONTRIBUTING.md` said MIT and pointed at a Convex security email. It is Apache-2.0 and points at the repo owner.
+
+## [1.0.9] - 2026-02-05
+
 ### Changed
 
 - Updated README.md to reference official Convex Agent Plugins repo as the primary resource

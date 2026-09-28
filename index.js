@@ -6,35 +6,47 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 /**
- * Get the path to the skills directory
+ * Path to the skills directory.
  */
 export function getSkillsPath() {
   return join(__dirname, "skills");
 }
 
 /**
- * Get the path to the templates directory
+ * Path to the templates directory.
  */
 export function getTemplatesPath() {
   return join(__dirname, "templates");
 }
 
 /**
- * List all available skills
+ * Names of every skill folder that ships in the package.
  */
 export function listSkills() {
-  const skillsPath = getSkillsPath();
-  const skills = readdirSync(skillsPath, { withFileTypes: true })
+  return readdirSync(getSkillsPath(), { withFileTypes: true })
     .filter((dirent) => dirent.isDirectory())
     .map((dirent) => dirent.name);
-  return skills;
 }
 
 /**
- * Get a skill's content by name
+ * Path to a skill's SKILL.md.
+ */
+export function getSkillPath(skillName) {
+  return join(getSkillsPath(), skillName, "SKILL.md");
+}
+
+/**
+ * Path to a skill's folder (SKILL.md plus references/ and agents/).
+ */
+export function getSkillDir(skillName) {
+  return join(getSkillsPath(), skillName);
+}
+
+/**
+ * Raw SKILL.md content for a skill.
  */
 export function getSkill(skillName) {
-  const skillPath = join(getSkillsPath(), skillName, "SKILL.md");
+  const skillPath = getSkillPath(skillName);
   if (!existsSync(skillPath)) {
     throw new Error(`Skill not found: ${skillName}`);
   }
@@ -42,29 +54,42 @@ export function getSkill(skillName) {
 }
 
 /**
- * Get the path to a specific skill
+ * Parse the name and description out of a SKILL.md frontmatter block.
  */
-export function getSkillPath(skillName) {
-  return join(getSkillsPath(), skillName, "SKILL.md");
+export function getSkillMeta(skillName) {
+  const content = getSkill(skillName);
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return { name: skillName, description: "" };
+  const meta = {};
+  for (const line of match[1].split("\n")) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    meta[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  }
+  return { name: meta.name ?? skillName, description: meta.description ?? "" };
 }
 
 /**
- * Available skills with descriptions
+ * One line summaries. Keep in sync with bin/cli.js and .claude-plugin/plugin.json.
  */
 export const SKILLS = {
-  "convex-best-practices":
-    "Guidelines for building production-ready Convex apps",
-  "convex-functions": "Writing queries, mutations, actions, and HTTP actions",
-  "convex-realtime": "Patterns for building reactive applications",
-  "convex-schema-validator": "Database schema definition and validation",
-  "convex-file-storage": "File upload, storage, and serving",
-  "convex-agents": "Building AI agents with Convex",
-  "convex-cron-jobs": "Scheduled functions and background tasks",
-  "convex-http-actions": "HTTP endpoints and webhook handling",
-  "convex-migrations": "Schema evolution and data migrations",
-  "convex-security-check": "Quick security audit checklist",
-  "convex-security-audit": "Deep security review patterns",
-  "convex-component-authoring": "Creating reusable Convex components",
+  convex: "Router for Convex work when no specific skill fits",
+  "convex-best-practices": "Production patterns and the ESLint plugin rules",
+  "convex-functions": "Queries, mutations, actions, internal functions",
+  "convex-schema-validator": "Schema design, validators, indexes",
+  "convex-realtime": "Reactive queries, optimistic updates, presence",
+  "convex-http-actions": "HTTP endpoints, webhooks, CORS, auth headers",
+  "convex-file-storage": "Upload, serve, and delete files",
+  "convex-cron-jobs": "Cron jobs and scheduled functions",
+  "convex-migrations": "Schema evolution and data backfills",
+  "convex-agents": "AI agents with the Convex agent component",
+  "convex-component-authoring": "Author and publish Convex components",
+  "convex-security-check": "Ten minute security checklist",
+  "convex-security-audit": "Deep security review before launch",
+  "avoid-feature-creep": "Keep scope tight, ship what was asked",
+  "project-workflow": "PRD first, task.md tracking, lessons loop",
+  "project-docs": "Sync task.md, changelog.md, files.md from git evidence",
+  "git-safety": "Block destructive git commands, diff before discard",
 };
 
 export default {
@@ -73,5 +98,7 @@ export default {
   listSkills,
   getSkill,
   getSkillPath,
+  getSkillDir,
+  getSkillMeta,
   SKILLS,
 };

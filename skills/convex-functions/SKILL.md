@@ -1,458 +1,275 @@
 ---
 name: convex-functions
-displayName: Convex Functions
-description: Writing queries, mutations, actions, and HTTP actions with proper argument validation, error handling, internal functions, and runtime considerations
-version: 1.0.0
-author: Convex
-tags: [convex, functions, queries, mutations, actions, http]
+description: Writes Convex queries, mutations, actions, and internal functions in the object form with args and returns validators, correct ctx usage, runtime boundaries, and error handling. Use when adding or changing anything in convex/*.ts that exports a function, or when deciding between query, mutation, and action.
 ---
 
-# Convex Functions
+# Convex functions
 
-Master Convex functions including queries, mutations, actions, and HTTP endpoints with proper validation, error handling, and runtime considerations.
+Every exported function in `convex/` uses the object form with `args` and `returns` validators. Pick the type by what the handler touches: queries read, mutations write, actions call out.
 
-## Code Quality
+## Pick the function type
 
-All examples in this skill comply with @convex-dev/eslint-plugin rules:
+| Type | Database | External calls | Callable by | Use for |
+| --- | --- | --- | --- | --- |
+| `query` | Read | No | Clients, other functions | Reads. Cached and reactive. |
+| `mutation` | Read and write | No | Clients, other functions | Writes. One transaction. |
+| `action` | Only via `runQuery` and `runMutation` | Yes | Clients, scheduler, other actions | `fetch`, third party SDKs, Node APIs |
+| `internalQuery`, `internalMutation`, `internalAction` | Same as the public form | Same | Only other Convex functions | Scheduled work, crons, privileged writes |
+| `httpAction` | Only via `runQuery` and `runMutation` | Yes | HTTP requests in `convex/http.ts` | Webhooks, REST endpoints |
 
-- Object syntax with `handler` property
-- Argument validators on all functions
-- Explicit table names in database operations
+Default to query or mutation. Reach for an action only when the handler must talk to something outside Convex.
 
-See the Code Quality section in [convex-best-practices](../convex-best-practices/SKILL.md) for linting setup.
+## The object form
 
-## Documentation Sources
-
-Before implementing, do not assume; fetch the latest documentation:
-
-- Primary: https://docs.convex.dev/functions
-- Query Functions: https://docs.convex.dev/functions/query-functions
-- Mutation Functions: https://docs.convex.dev/functions/mutation-functions
-- Actions: https://docs.convex.dev/functions/actions
-- HTTP Actions: https://docs.convex.dev/functions/http-actions
-- For broader context: https://docs.convex.dev/llms.txt
-
-## Instructions
-
-### Function Types Overview
-
-| Type        | Database Access          | External APIs | Caching       | Use Case              |
-| ----------- | ------------------------ | ------------- | ------------- | --------------------- |
-| Query       | Read-only                | No            | Yes, reactive | Fetching data         |
-| Mutation    | Read/Write               | No            | No            | Modifying data        |
-| Action      | Via runQuery/runMutation | Yes           | No            | External integrations |
-| HTTP Action | Via runQuery/runMutation | Yes           | No            | Webhooks, APIs        |
-
-### Queries
-
-Queries are reactive, cached, and read-only:
+Declare `args` and `returns` on every function. A function that returns nothing declares `returns: v.null()` and returns `null`. Hoist a shared document validator when several functions return the same shape.
 
 ```typescript
-import { query } from "./_generated/server";
+// convex/tasks.ts
+import { query, mutation } from "./_generated/server";
 import { v } from "convex/values";
 
-export const getUser = query({
-  args: { userId: v.id("users") },
-  returns: v.union(
-    v.object({
-      _id: v.id("users"),
-      _creationTime: v.number(),
-      name: v.string(),
-      email: v.string(),
-    }),
-    v.null(),
-  ),
+const taskValidator = v.object({
+  _id: v.id("tasks"),
+  _creationTime: v.number(),
+  userId: v.id("users"),
+  title: v.string(),
+  completed: v.boolean(),
+});
+
+export const get = query({
+  args: { taskId: v.id("tasks") },
+  returns: v.union(taskValidator, v.null()),
   handler: async (ctx, args) => {
-    return await ctx.db.get("users", args.userId);
+    return await ctx.db.get(args.taskId);
   },
 });
 
-// Query with index
-export const listUserTasks = query({
+export const remove = mutation({
+  args: { taskId: v.id("tasks") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.taskId);
+    return null;
+  },
+});
+```
+
+## Reading data
+
+Use `ctx.db.get(id)` for one document by id. For everything else use `withIndex` against an index defined in `convex/schema.ts`. Never call `.filter()` on a table query; it scans the whole table.
+
+```typescript
+export const listByUser = query({
   args: { userId: v.id("users") },
-  returns: v.array(
-    v.object({
-      _id: v.id("tasks"),
-      _creationTime: v.number(),
-      title: v.string(),
-      completed: v.boolean(),
-    }),
-  ),
+  returns: v.array(taskValidator),
   handler: async (ctx, args) => {
     return await ctx.db
       .query("tasks")
       .withIndex("by_user", (q) => q.eq("userId", args.userId))
       .order("desc")
-      .collect();
+      .take(50);
   },
 });
 ```
 
-### Mutations
+Pick the terminal method by how many documents you expect:
 
-Mutations modify the database and are transactional:
+| Method | Returns | Use when |
+| --- | --- | --- |
+| `.unique()` | One doc or null, throws on more than one | The index guarantees at most one match |
+| `.first()` | First doc or null | You want the newest or oldest match |
+| `.take(n)` | Up to n docs | A bounded list such as a recent feed |
+| `.collect()` | Every match | The result set is small and stays small |
+| `.paginate(opts)` | A page plus cursor | The table is unbounded |
+
+Paginated queries take `paginationOpts: paginationOptsValidator` (from `convex/server`) as an argument.
+
+## Writing data
+
+| Method | What it does |
+| --- | --- |
+| `ctx.db.insert("tasks", doc)` | Inserts and returns the new id |
+| `ctx.db.patch(id, fields)` | Shallow merges fields. Throws if the doc is missing |
+| `ctx.db.replace(id, doc)` | Replaces the whole doc. Throws if missing |
+| `ctx.db.delete(id)` | Deletes the doc |
+
+Patch directly when you do not need the old value. Reading first widens the window for write conflicts. Make mutations safe to retry.
 
 ```typescript
-import { mutation } from "./_generated/server";
-import { v } from "convex/values";
-import { ConvexError } from "convex/values";
-
-export const createTask = mutation({
-  args: {
-    title: v.string(),
-    userId: v.id("users"),
-  },
-  returns: v.id("tasks"),
-  handler: async (ctx, args) => {
-    // Validate user exists
-    const user = await ctx.db.get("users", args.userId);
-    if (!user) {
-      throw new ConvexError("User not found");
-    }
-
-    return await ctx.db.insert("tasks", {
-      title: args.title,
-      userId: args.userId,
-      completed: false,
-      createdAt: Date.now(),
-    });
-  },
-});
-
-export const deleteTask = mutation({
-  args: { taskId: v.id("tasks") },
+export const rename = mutation({
+  args: { taskId: v.id("tasks"), title: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {
-    await ctx.db.delete("tasks", args.taskId);
+    await ctx.db.patch(args.taskId, { title: args.title });
     return null;
   },
 });
 ```
 
-### Actions
+## Internal functions and references
 
-Actions can call external APIs but have no direct database access:
+`query`, `mutation`, and `action` are public. Anyone with the deployment URL can call them. Use `internalQuery`, `internalMutation`, and `internalAction` for code that should only run from other Convex code: scheduled jobs, crons, webhook handlers, privileged writes.
 
-```typescript
-"use node";
+Reference functions through the generated objects in `./_generated/api`:
 
-import { action } from "./_generated/server";
-import { v } from "convex/values";
-import { api, internal } from "./_generated/api";
+- `api.tasks.get` points at a public function in `convex/tasks.ts`
+- `internal.tasks.markPaid` points at an internal function in the same file
+- Folders map to paths: `convex/billing/invoices.ts` gives `api.billing.invoices.list`
 
-export const sendEmail = action({
-  args: {
-    to: v.string(),
-    subject: v.string(),
-    body: v.string(),
-  },
-  returns: v.object({ success: v.boolean() }),
-  handler: async (ctx, args) => {
-    // Call external API
-    const response = await fetch("https://api.email.com/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(args),
-    });
-
-    return { success: response.ok };
-  },
-});
-
-// Action calling queries and mutations
-export const processOrder = action({
-  args: { orderId: v.id("orders") },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    // Read data via query
-    const order = await ctx.runQuery(api.orders.get, { orderId: args.orderId });
-
-    if (!order) {
-      throw new Error("Order not found");
-    }
-
-    // Call external payment API
-    const paymentResult = await processPayment(order);
-
-    // Update database via mutation
-    await ctx.runMutation(internal.orders.updateStatus, {
-      orderId: args.orderId,
-      status: paymentResult.success ? "paid" : "failed",
-    });
-
-    return null;
-  },
-});
-```
-
-### HTTP Actions
-
-HTTP actions handle webhooks and external requests:
-
-```typescript
-// convex/http.ts
-import { httpRouter } from "convex/server";
-import { httpAction } from "./_generated/server";
-import { api, internal } from "./_generated/api";
-
-const http = httpRouter();
-
-// Webhook endpoint
-http.route({
-  path: "/webhooks/stripe",
-  method: "POST",
-  handler: httpAction(async (ctx, request) => {
-    const signature = request.headers.get("stripe-signature");
-    const body = await request.text();
-
-    // Verify webhook signature
-    if (!verifyStripeSignature(body, signature)) {
-      return new Response("Invalid signature", { status: 401 });
-    }
-
-    const event = JSON.parse(body);
-
-    // Process webhook
-    await ctx.runMutation(internal.payments.handleWebhook, {
-      eventType: event.type,
-      data: event.data,
-    });
-
-    return new Response("OK", { status: 200 });
-  }),
-});
-
-// API endpoint
-http.route({
-  path: "/api/users/:userId",
-  method: "GET",
-  handler: httpAction(async (ctx, request) => {
-    const url = new URL(request.url);
-    const userId = url.pathname.split("/").pop();
-
-    const user = await ctx.runQuery(api.users.get, {
-      userId: userId as Id<"users">,
-    });
-
-    if (!user) {
-      return new Response("Not found", { status: 404 });
-    }
-
-    return Response.json(user);
-  }),
-});
-
-export default http;
-```
-
-### Internal Functions
-
-Use internal functions for sensitive operations:
-
-```typescript
-import {
-  internalMutation,
-  internalQuery,
-  internalAction,
-} from "./_generated/server";
-import { v } from "convex/values";
-
-// Only callable from other Convex functions
-export const _updateUserCredits = internalMutation({
-  args: {
-    userId: v.id("users"),
-    amount: v.number(),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    const user = await ctx.db.get("users", args.userId);
-    if (!user) return null;
-
-    await ctx.db.patch("users", args.userId, {
-      credits: (user.credits || 0) + args.amount,
-    });
-    return null;
-  },
-});
-
-// Call internal function from action
-export const purchaseCredits = action({
-  args: { userId: v.id("users"), amount: v.number() },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    // Process payment externally
-    await processPayment(args.amount);
-
-    // Update credits via internal mutation
-    await ctx.runMutation(internal.users._updateUserCredits, {
-      userId: args.userId,
-      amount: args.amount,
-    });
-
-    return null;
-  },
-});
-```
-
-### Scheduling Functions
-
-Schedule functions to run later:
-
-```typescript
-import { mutation, internalMutation } from "./_generated/server";
-import { v } from "convex/values";
-import { internal } from "./_generated/api";
-
-export const scheduleReminder = mutation({
-  args: {
-    userId: v.id("users"),
-    message: v.string(),
-    delayMs: v.number(),
-  },
-  returns: v.id("_scheduled_functions"),
-  handler: async (ctx, args) => {
-    return await ctx.scheduler.runAfter(
-      args.delayMs,
-      internal.notifications.sendReminder,
-      { userId: args.userId, message: args.message },
-    );
-  },
-});
-
-export const sendReminder = internalMutation({
-  args: {
-    userId: v.id("users"),
-    message: v.string(),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.insert("notifications", {
-      userId: args.userId,
-      message: args.message,
-      sentAt: Date.now(),
-    });
-    return null;
-  },
-});
-```
-
-## Examples
-
-### Complete Function File
+Always schedule `internal.*`. Scheduled functions and crons run without a client, so a public reference there skips the auth checks a client call would hit.
 
 ```typescript
 // convex/messages.ts
-import { query, mutation, internalMutation } from "./_generated/server";
-import { v } from "convex/values";
-import { ConvexError } from "convex/values";
+import { mutation, internalMutation } from "./_generated/server";
 import { internal } from "./_generated/api";
+import { v } from "convex/values";
 
-const messageValidator = v.object({
-  _id: v.id("messages"),
-  _creationTime: v.number(),
-  channelId: v.id("channels"),
-  authorId: v.id("users"),
-  content: v.string(),
-  editedAt: v.optional(v.number()),
-});
-
-// Public query
-export const list = query({
-  args: {
-    channelId: v.id("channels"),
-    limit: v.optional(v.number()),
-  },
-  returns: v.array(messageValidator),
-  handler: async (ctx, args) => {
-    const limit = args.limit ?? 50;
-    return await ctx.db
-      .query("messages")
-      .withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
-      .order("desc")
-      .take(limit);
-  },
-});
-
-// Public mutation
 export const send = mutation({
-  args: {
-    channelId: v.id("channels"),
-    authorId: v.id("users"),
-    content: v.string(),
-  },
+  args: { channelId: v.id("channels"), content: v.string() },
   returns: v.id("messages"),
   handler: async (ctx, args) => {
-    if (args.content.trim().length === 0) {
-      throw new ConvexError("Message cannot be empty");
-    }
-
-    const messageId = await ctx.db.insert("messages", {
-      channelId: args.channelId,
-      authorId: args.authorId,
-      content: args.content.trim(),
-    });
-
-    // Schedule notification
+    const messageId = await ctx.db.insert("messages", args);
     await ctx.scheduler.runAfter(0, internal.messages.notifySubscribers, {
       channelId: args.channelId,
       messageId,
     });
-
     return messageId;
   },
 });
 
-// Internal mutation
 export const notifySubscribers = internalMutation({
-  args: {
-    channelId: v.id("channels"),
-    messageId: v.id("messages"),
-  },
+  args: { channelId: v.id("channels"), messageId: v.id("messages") },
   returns: v.null(),
   handler: async (ctx, args) => {
-    // Get channel subscribers and notify them
-    const subscribers = await ctx.db
+    const subs = await ctx.db
       .query("subscriptions")
       .withIndex("by_channel", (q) => q.eq("channelId", args.channelId))
       .collect();
-
-    for (const sub of subscribers) {
-      await ctx.db.insert("notifications", {
-        userId: sub.userId,
-        messageId: args.messageId,
-        read: false,
-      });
-    }
+    await Promise.all(
+      subs.map((sub) =>
+        ctx.db.insert("notifications", {
+          userId: sub.userId,
+          messageId: args.messageId,
+          read: false,
+        }),
+      ),
+    );
     return null;
   },
 });
 ```
 
-## Best Practices
+## Actions and runtime boundaries
 
-- Never run `npx convex deploy` unless explicitly instructed
-- Never run any git commands unless explicitly instructed
-- Always define args and returns validators
-- Use queries for read operations (they are cached and reactive)
-- Use mutations for write operations (they are transactional)
-- Use actions only when calling external APIs
-- Use internal functions for sensitive operations
-- Add `"use node";` at the top of action files using Node.js APIs
-- Handle errors with ConvexError for user-facing messages
+Actions have no `ctx.db`. They read through `ctx.runQuery` and write through `ctx.runMutation`. Each call is its own transaction, so keep the count low and do related reads and writes inside one mutation.
 
-## Common Pitfalls
+`fetch` works in the default runtime. Add `"use node";` as the first line of a file only when an action needs Node built ins or a Node only SDK. A `"use node"` file can export actions only; queries and mutations go in a separate file.
 
-1. **Using actions for database operations** - Use queries/mutations instead
-2. **Calling external APIs from queries/mutations** - Use actions
-3. **Forgetting to add "use node"** - Required for Node.js APIs in actions
-4. **Missing return validators** - Always specify returns
-5. **Not using internal functions for sensitive logic** - Protect with internalMutation
+```typescript
+// convex/orders.ts (default runtime)
+import { action } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v, ConvexError } from "convex/values";
+import { Doc } from "./_generated/dataModel";
 
-## References
+export const charge = action({
+  args: { orderId: v.id("orders") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    // Same file call: annotate the result so TypeScript does not hit a circular type
+    const order: Doc<"orders"> | null = await ctx.runQuery(
+      internal.orders.getForCharge,
+      { orderId: args.orderId },
+    );
+    if (!order) {
+      throw new ConvexError("Order not found");
+    }
+    const res = await fetch("https://api.payments.example/charge", {
+      method: "POST",
+      body: JSON.stringify({ amount: order.total }),
+    });
+    await ctx.runMutation(internal.orders.setStatus, {
+      orderId: args.orderId,
+      status: res.ok ? "paid" : "failed",
+    });
+    return null;
+  },
+});
+```
 
-- Convex Documentation: https://docs.convex.dev/
-- Convex LLMs.txt: https://docs.convex.dev/llms.txt
-- Functions Overview: https://docs.convex.dev/functions
-- Query Functions: https://docs.convex.dev/functions/query-functions
-- Mutation Functions: https://docs.convex.dev/functions/mutation-functions
-- Actions: https://docs.convex.dev/functions/actions
+`Doc` and `Id` come from `./_generated/dataModel`. The annotation is only needed when the called function lives in the same file.
+
+## Errors
+
+Throw `ConvexError` from `convex/values` for anything a client should read. Its `data` reaches the client; a plain `Error` message is redacted in production. Return `null` for expected absences such as a lookup that finds nothing. Throw for real failures: not authenticated, not authorized, invalid input.
+
+```typescript
+import { ConvexError } from "convex/values";
+
+throw new ConvexError({ code: "NOT_FOUND", message: "Task not found" });
+```
+
+## Thin wrappers
+
+Keep handlers short. Put auth lookups, validation, and business logic in plain async functions that take `ctx` first, then call them from the wrapper. Plain helpers are testable and shared between queries and mutations without a `ctx.runQuery` hop.
+
+```typescript
+import { QueryCtx, MutationCtx } from "./_generated/server";
+import { ConvexError } from "convex/values";
+
+export async function getCurrentUser(ctx: QueryCtx | MutationCtx) {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    throw new ConvexError("Not authenticated");
+  }
+  const user = await ctx.db
+    .query("users")
+    .withIndex("by_token", (q) =>
+      q.eq("tokenIdentifier", identity.tokenIdentifier),
+    )
+    .unique();
+  if (!user) {
+    throw new ConvexError("User not found");
+  }
+  return user;
+}
+```
+
+From a query or mutation, call the helper directly. `ctx.runQuery` and `ctx.runMutation` are for actions and component boundaries.
+
+## Common mistakes
+
+| Mistake | Why it breaks | Do instead |
+| --- | --- | --- |
+| No `returns` validator | Return shape drifts and client types lie | Declare `returns`, use `v.null()` for nothing |
+| `.filter()` on a table query | Full table scan | Add an index, use `withIndex` |
+| `ctx.db` inside an action | Actions have no database handle | `ctx.runQuery` and `ctx.runMutation` |
+| `fetch` inside a query or mutation | Transactions must be deterministic | Move it to an action |
+| Scheduling `api.*` | Runs public code without a client, skips auth | Schedule `internal.*` |
+| `"use node"` in a file with queries | Bundler rejects the file | Split actions into their own file |
+| `Date.now()` in a query | Breaks caching and reactivity | Pass time as an arg or store a status field |
+| Many `runQuery` calls from one action | Each is a separate transaction, races appear | One mutation that does the related work |
+| Plain `Error` for user messages | Message is hidden in production | `ConvexError` |
+| Missing `await` on `ctx.db` or scheduler | Write may not commit | Await every `ctx` call |
+
+## Checklist
+
+- [ ] Object form with `args` and `returns` on every exported function
+- [ ] `returns: v.null()` and `return null` when there is nothing to return
+- [ ] Reads use `ctx.db.get(id)` or `withIndex`, never `.filter()`
+- [ ] Unbounded tables use `.paginate()` or `.take(n)`, not `.collect()`
+- [ ] Mutations patch directly and are safe to retry
+- [ ] Scheduled and cron targets are `internal.*`
+- [ ] Actions never touch `ctx.db`
+- [ ] `"use node"` only in files that export actions and need Node
+- [ ] Same file `runQuery` and `runMutation` results have a type annotation
+- [ ] Client visible errors are `ConvexError`
+- [ ] Every `ctx.*` promise is awaited
+
+## Docs
+
+- https://docs.convex.dev/llms.txt
+- https://docs.convex.dev/functions
+- https://docs.convex.dev/functions/validation
+- https://docs.convex.dev/functions/actions
+- https://docs.convex.dev/functions/error-handling

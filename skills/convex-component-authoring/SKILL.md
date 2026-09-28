@@ -1,457 +1,246 @@
 ---
 name: convex-component-authoring
-displayName: Convex Component Authoring
-description: How to create, structure, and publish self-contained Convex components with proper isolation, exports, and dependency management
-version: 1.0.0
-author: Convex
-tags: [convex, components, reusable, packages, npm]
+description: Creates reusable Convex components with defineComponent, a clean client wrapper, their own schema, and an npm publish setup. Use when extracting a feature into a package, building something for the Convex component directory, or when a component's functions are not showing up in the parent app.
 ---
 
-# Convex Component Authoring
+# Convex component authoring
 
-Create self-contained, reusable Convex components with proper isolation, exports, and dependency management for sharing across projects.
+Produces a self contained component: its own `convex.config.ts`, schema, functions, and a typed client wrapper the parent app calls. The one rule: a component cannot read the parent's tables, `ctx.auth`, or `process.env`. Whatever it needs, the app passes in as arguments.
 
-## Documentation Sources
+## When to reach for this
 
-Before implementing, do not assume; fetch the latest documentation:
+- Extracting a feature (counters, rate limits, audit logs, notifications) into a package
+- Building something for the Convex component directory
+- A component's functions are missing from `components.<name>` in the parent app
+- A third party integration should own its own tables and background jobs
+- The same backend module is needed in several apps
 
-- Primary: https://docs.convex.dev/components
-- Component Authoring: https://docs.convex.dev/components/authoring
-- For broader context: https://docs.convex.dev/llms.txt
+## Component or helper function
 
-## Instructions
+| Need | Use |
+| --- | --- |
+| Shared logic over the app's own tables | Plain TypeScript helper in `convex/lib/` |
+| Its own tables with a schema the app cannot touch | Component |
+| Isolated functions that run in their own transaction | Component |
+| Reuse across apps with one install line | Component |
+| A React hook or client utility only | npm library, no component |
 
-### What Are Convex Components?
+If the feature does not need persistent state behind an API boundary, a helper function is less work and easier to type.
 
-Convex components are self-contained packages that include:
-- Database tables (isolated from the main app)
-- Functions (queries, mutations, actions)
-- TypeScript types and validators
-- Optional frontend hooks
-
-### Component Structure
+## Folder layout
 
 ```
-my-convex-component/
-├── package.json
-├── tsconfig.json
-├── README.md
-├── src/
-│   ├── index.ts           # Main exports
-│   ├── component.ts       # Component definition
-│   ├── schema.ts          # Component schema
-│   └── functions/
-│       ├── queries.ts
-│       ├── mutations.ts
-│       └── actions.ts
-└── convex.config.ts       # Component configuration
+my-component/
+  package.json
+  src/
+    component/
+      convex.config.ts     # defineComponent("counter")
+      schema.ts            # tables only this component can see
+      public.ts            # queries, mutations, actions
+      _generated/          # created by npx convex codegen
+    client/
+      index.ts             # wrapper class the app imports
+  example/
+    convex/
+      convex.config.ts     # app.use(counter) for local testing
 ```
 
-### Creating a Component
+For a local only component, put the `component/` contents at `convex/components/<name>/` and skip `client/` and `package.json`.
 
-#### 1. Component Configuration
+## Define the component
 
 ```typescript
-// convex.config.ts
+// src/component/convex.config.ts
 import { defineComponent } from "convex/server";
 
-export default defineComponent("myComponent");
+const component = defineComponent("counter");
+export default component;
 ```
 
-#### 2. Component Schema
-
 ```typescript
-// src/schema.ts
+// src/component/schema.ts
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
 export default defineSchema({
-  // Tables are isolated to this component
-  items: defineTable({
+  counters: defineTable({
     name: v.string(),
-    data: v.any(),
-    createdAt: v.number(),
+    value: v.number(),
   }).index("by_name", ["name"]),
-  
-  config: defineTable({
-    key: v.string(),
-    value: v.any(),
-  }).index("by_key", ["key"]),
 });
 ```
 
-#### 3. Component Definition
+Functions import `query` and `mutation` from the component's own `_generated/server`, never from the app's. Every public function needs `args` and `returns` validators; without them the parent sees `any`.
 
 ```typescript
-// src/component.ts
-import { defineComponent, ComponentDefinition } from "convex/server";
-import schema from "./schema";
-import * as queries from "./functions/queries";
-import * as mutations from "./functions/mutations";
-
-const component = defineComponent("myComponent", {
-  schema,
-  functions: {
-    ...queries,
-    ...mutations,
-  },
-});
-
-export default component;
-```
-
-#### 4. Component Functions
-
-```typescript
-// src/functions/queries.ts
-import { query } from "../_generated/server";
+// src/component/public.ts
 import { v } from "convex/values";
+import { mutation, query } from "./_generated/server.js";
 
-export const list = query({
-  args: {
-    limit: v.optional(v.number()),
-  },
-  returns: v.array(v.object({
-    _id: v.id("items"),
-    name: v.string(),
-    data: v.any(),
-    createdAt: v.number(),
-  })),
+export const add = mutation({
+  args: { name: v.string(), amount: v.number() },
+  returns: v.number(),
   handler: async (ctx, args) => {
-    return await ctx.db
-      .query("items")
-      .order("desc")
-      .take(args.limit ?? 10);
+    const existing = await ctx.db
+      .query("counters")
+      .withIndex("by_name", (q) => q.eq("name", args.name))
+      .unique();
+    if (!existing) {
+      await ctx.db.insert("counters", { name: args.name, value: args.amount });
+      return args.amount;
+    }
+    const value = existing.value + args.amount;
+    await ctx.db.patch(existing._id, { value });
+    return value;
   },
 });
 
 export const get = query({
   args: { name: v.string() },
-  returns: v.union(v.object({
-    _id: v.id("items"),
-    name: v.string(),
-    data: v.any(),
-  }), v.null()),
+  returns: v.number(),
   handler: async (ctx, args) => {
-    return await ctx.db
-      .query("items")
+    const counter = await ctx.db
+      .query("counters")
       .withIndex("by_name", (q) => q.eq("name", args.name))
       .unique();
+    return counter?.value ?? 0;
   },
 });
 ```
 
-```typescript
-// src/functions/mutations.ts
-import { mutation } from "../_generated/server";
-import { v } from "convex/values";
-
-export const create = mutation({
-  args: {
-    name: v.string(),
-    data: v.any(),
-  },
-  returns: v.id("items"),
-  handler: async (ctx, args) => {
-    return await ctx.db.insert("items", {
-      name: args.name,
-      data: args.data,
-      createdAt: Date.now(),
-    });
-  },
-});
-
-export const update = mutation({
-  args: {
-    id: v.id("items"),
-    data: v.any(),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.patch(args.id, { data: args.data });
-    return null;
-  },
-});
-
-export const remove = mutation({
-  args: { id: v.id("items") },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.delete(args.id);
-    return null;
-  },
-});
-```
-
-#### 5. Main Exports
+## Register it in the parent
 
 ```typescript
-// src/index.ts
-export { default as component } from "./component";
-export * from "./functions/queries";
-export * from "./functions/mutations";
-
-// Export types for consumers
-export type { Id } from "./_generated/dataModel";
-```
-
-### Using a Component
-
-```typescript
-// In the consuming app's convex/convex.config.ts
+// convex/convex.config.ts (parent app)
 import { defineApp } from "convex/server";
-import myComponent from "my-convex-component";
+import counter from "@acme/counter/convex.config.js";
+// local component: import counter from "./components/counter/convex.config.js";
 
 const app = defineApp();
-
-app.use(myComponent, { name: "myComponent" });
-
+app.use(counter);
+// A second instance under a different name:
+// app.use(counter, { name: "pageViews" });
 export default app;
 ```
 
-```typescript
-// In the consuming app's code
-import { useQuery, useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
+Run `npx convex dev`. It generates `components.counter` in the app's `convex/_generated/api` and the component's own `_generated/` folder. The reference path mirrors the file: a function in `public.ts` is `components.counter.public.add`.
 
-function MyApp() {
-  // Access component functions through the app's API
-  const items = useQuery(api.myComponent.list, { limit: 10 });
-  const createItem = useMutation(api.myComponent.create);
-  
-  return (
-    <div>
-      {items?.map((item) => (
-        <div key={item._id}>{item.name}</div>
-      ))}
-      <button onClick={() => createItem({ name: "New", data: {} })}>
-        Add Item
-      </button>
-    </div>
-  );
-}
-```
+Component functions arrive in the parent as internal references. Call them with `ctx.runQuery` and `ctx.runMutation`; clients cannot hit them directly.
 
-### Component Configuration Options
+## Client wrapper class
+
+The wrapper runs in the app's environment, so it can read `ctx.auth` and `process.env` and pass what the component needs. It takes the component reference first and options second.
 
 ```typescript
-// convex/convex.config.ts
-import { defineApp } from "convex/server";
-import myComponent from "my-convex-component";
+// src/client/index.ts
+import type {
+  GenericDataModel,
+  GenericMutationCtx,
+  GenericQueryCtx,
+} from "convex/server";
+import type { ComponentApi } from "../component/_generated/component.js";
 
-const app = defineApp();
+// Pick only the capabilities each method needs so any ctx with runQuery works
+type QueryCtx = Pick<GenericQueryCtx<GenericDataModel>, "runQuery">;
+type MutationCtx = Pick<GenericMutationCtx<GenericDataModel>, "runMutation">;
 
-// Basic usage
-app.use(myComponent);
+export class Counter {
+  constructor(
+    public component: ComponentApi,
+    private options: { prefix?: string } = {},
+  ) {}
 
-// With custom name
-app.use(myComponent, { name: "customName" });
+  private key(name: string): string {
+    return this.options.prefix ? `${this.options.prefix}:${name}` : name;
+  }
 
-// Multiple instances
-app.use(myComponent, { name: "instance1" });
-app.use(myComponent, { name: "instance2" });
-
-export default app;
-```
-
-### Providing Component Hooks
-
-```typescript
-// src/hooks.ts
-import { useQuery, useMutation } from "convex/react";
-import { FunctionReference } from "convex/server";
-
-// Type-safe hooks for component consumers
-export function useMyComponent(api: {
-  list: FunctionReference<"query">;
-  create: FunctionReference<"mutation">;
-}) {
-  const items = useQuery(api.list, {});
-  const createItem = useMutation(api.create);
-  
-  return {
-    items,
-    createItem,
-    isLoading: items === undefined,
-  };
-}
-```
-
-### Publishing a Component
-
-#### package.json
-
-```json
-{
-  "name": "my-convex-component",
-  "version": "1.0.0",
-  "description": "A reusable Convex component",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": [
-    "dist",
-    "convex.config.ts"
-  ],
-  "scripts": {
-    "build": "tsc",
-    "prepublishOnly": "npm run build"
-  },
-  "peerDependencies": {
-    "convex": "^1.0.0"
-  },
-  "devDependencies": {
-    "convex": "^1.17.0",
-    "typescript": "^5.0.0"
-  },
-  "keywords": [
-    "convex",
-    "component"
-  ]
-}
-```
-
-#### tsconfig.json
-
-```json
-{
-  "compilerOptions": {
-    "target": "ES2020",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "declaration": true,
-    "outDir": "dist",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true
-  },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist"]
-}
-```
-
-## Examples
-
-### Rate Limiter Component
-
-```typescript
-// rate-limiter/src/schema.ts
-import { defineSchema, defineTable } from "convex/server";
-import { v } from "convex/values";
-
-export default defineSchema({
-  requests: defineTable({
-    key: v.string(),
-    timestamp: v.number(),
-  })
-    .index("by_key", ["key"])
-    .index("by_key_and_time", ["key", "timestamp"]),
-});
-```
-
-```typescript
-// rate-limiter/src/functions/mutations.ts
-import { mutation } from "../_generated/server";
-import { v } from "convex/values";
-
-export const checkLimit = mutation({
-  args: {
-    key: v.string(),
-    limit: v.number(),
-    windowMs: v.number(),
-  },
-  returns: v.object({
-    allowed: v.boolean(),
-    remaining: v.number(),
-    resetAt: v.number(),
-  }),
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const windowStart = now - args.windowMs;
-    
-    // Clean old entries
-    const oldEntries = await ctx.db
-      .query("requests")
-      .withIndex("by_key_and_time", (q) => 
-        q.eq("key", args.key).lt("timestamp", windowStart)
-      )
-      .collect();
-    
-    for (const entry of oldEntries) {
-      await ctx.db.delete(entry._id);
-    }
-    
-    // Count current window
-    const currentRequests = await ctx.db
-      .query("requests")
-      .withIndex("by_key", (q) => q.eq("key", args.key))
-      .collect();
-    
-    const remaining = Math.max(0, args.limit - currentRequests.length);
-    const allowed = remaining > 0;
-    
-    if (allowed) {
-      await ctx.db.insert("requests", {
-        key: args.key,
-        timestamp: now,
-      });
-    }
-    
-    const oldestRequest = currentRequests[0];
-    const resetAt = oldestRequest 
-      ? oldestRequest.timestamp + args.windowMs 
-      : now + args.windowMs;
-    
-    return { allowed, remaining: remaining - (allowed ? 1 : 0), resetAt };
-  },
-});
-```
-
-```typescript
-// Usage in consuming app
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function useRateLimitedAction() {
-  const checkLimit = useMutation(api.rateLimiter.checkLimit);
-  
-  return async (action: () => Promise<void>) => {
-    const result = await checkLimit({
-      key: "user-action",
-      limit: 10,
-      windowMs: 60000,
+  async add(ctx: MutationCtx, name: string, amount = 1): Promise<number> {
+    return await ctx.runMutation(this.component.public.add, {
+      name: this.key(name),
+      amount,
     });
-    
-    if (!result.allowed) {
-      throw new Error(`Rate limited. Try again at ${new Date(result.resetAt)}`);
-    }
-    
-    await action();
-  };
+  }
+
+  async get(ctx: QueryCtx, name: string): Promise<number> {
+    return await ctx.runQuery(this.component.public.get, { name: this.key(name) });
+  }
 }
 ```
 
-## Best Practices
+```typescript
+// convex/counter.ts (parent app)
+import { v } from "convex/values";
+import { mutation, query } from "./_generated/server";
+import { components } from "./_generated/api";
+import { Counter } from "@acme/counter";
 
-- Never run `npx convex deploy` unless explicitly instructed
-- Never run any git commands unless explicitly instructed
-- Keep component tables isolated (don't reference main app tables)
-- Export clear TypeScript types for consumers
-- Document all public functions and their arguments
-- Use semantic versioning for component releases
-- Include comprehensive README with examples
-- Test components in isolation before publishing
+const counter = new Counter(components.counter, { prefix: "app" });
 
-## Common Pitfalls
+// The app owns auth. The component only sees the string it is handed.
+export const incrementMine = mutation({
+  args: {},
+  returns: v.number(),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("Not authenticated");
+    return await counter.add(ctx, identity.subject);
+  },
+});
 
-1. **Cross-referencing tables** - Component tables should be self-contained
-2. **Missing type exports** - Export all necessary types
-3. **Hardcoded configuration** - Use component options for customization
-4. **No versioning** - Follow semantic versioning
-5. **Poor documentation** - Document all public APIs
+export const getMine = query({
+  args: {},
+  returns: v.number(),
+  handler: async (ctx) => {
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new Error("Not authenticated");
+    return await counter.get(ctx, identity.subject);
+  },
+});
+```
 
-## References
+These app side functions are what React calls through `api.counter.incrementMine`. The app decides on auth and rate limits; the component stays generic.
 
-- Convex Documentation: https://docs.convex.dev/
-- Convex LLMs.txt: https://docs.convex.dev/llms.txt
-- Components: https://docs.convex.dev/components
-- Component Authoring: https://docs.convex.dev/components/authoring
+## Boundary rules
+
+- **No parent tables.** `v.id("users")` inside a component refers to a component table named `users`, not the app's. Accept parent ids as `v.string()`.
+- **Ids become strings.** Every `Id<"counters">` in the component is `string` in `ComponentApi`. Return them as strings on purpose.
+- **No `ctx.auth`.** Resolve the user in the app and pass `userId`.
+- **No app `process.env`.** Declare typed env in `defineComponent("name", { env: { API_KEY: v.string() } })` and let the app supply it with `app.use(c, { env: { API_KEY: ... } })`, or pass the value as a function argument.
+- **`.paginate()` does not work across the boundary.** Use `paginator` from `convex-helpers` inside the component.
+- **HTTP routes** in a component's `http.ts` are mounted by the app with `httpPrefix`. Component HTTP actions have no `ctx.auth`.
+- **Callbacks into the app** travel as function handles: `createFunctionHandle(internal.x.y)` in the app, stored as `v.string()`, cast to `FunctionHandle<"mutation">` in the component.
+
+Publishing to npm (exports map, build order, README, versioning) is covered in [references/publishing.md](references/publishing.md); open it when the component will be installed from a package rather than a local folder.
+
+## Common mistakes
+
+| Mistake | Why it breaks | Do instead |
+| --- | --- | --- |
+| Functions missing from `components.<name>` | `app.use(...)` not added, or `npx convex dev` has not run since | Register in `convex.config.ts`, run dev, check the reference path matches the file name |
+| Importing `mutation` from the app's `_generated/server` | The function registers on the app, not the component | Import from the component's own `./_generated/server.js` |
+| Calling `api.counter.add` from React | Component functions are internal references in the parent | Write an app mutation that calls `ctx.runMutation(components.counter.public.add)` |
+| `v.id("users")` in component args | Table numbers differ per component, validation fails | `v.string()` at the boundary |
+| `ctx.auth.getUserIdentity()` inside the component | Always returns no user | Authenticate in the app, pass `userId` |
+| `process.env.MY_KEY` inside the component | Undefined at runtime | Declare env in `defineComponent` or pass as an argument |
+| Public function without `returns` | Parent sees `any`, loses type safety | Add validators to every public function |
+| Reading component env at module scope | Undefined during deploy analysis | Read `env.X` inside the handler |
+
+## Checklist
+
+- [ ] Decided a component is needed rather than a helper function
+- [ ] `convex.config.ts` calls `defineComponent("<name>")` and exports it
+- [ ] Schema lives in the component; no `v.id()` for parent tables anywhere
+- [ ] Functions import from the component's own `_generated/server`
+- [ ] Every public function has `args` and `returns` validators
+- [ ] Parent registers with `app.use(...)` and `npx convex dev` runs clean
+- [ ] Client wrapper takes `ComponentApi` first, options second, uses `Pick` ctx types
+- [ ] App side wrapper functions handle auth and pass ids as strings
+- [ ] No `ctx.auth`, `process.env`, or `.paginate()` inside the component
+- [ ] Tested through an example app that installs the component
+
+## Docs
+
+- https://docs.convex.dev/llms.txt
+- https://docs.convex.dev/components/authoring
+- https://docs.convex.dev/components/using
+- https://www.convex.dev/components

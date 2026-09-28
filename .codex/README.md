@@ -1,57 +1,28 @@
-# Codex Skills Integration
+# Codex integration
 
-This folder enables Codex to auto-discover Convex skills from this repository.
+Codex discovers skills from `.codex/skills` at the repo root. This folder holds one symlink per skill pointing at `../../skills/<name>` so the source of truth stays in `skills/`.
 
-## Setup
-
-Codex auto-discovers skills from `.codex/skills` at the repo root. To link the skills:
+## In another project
 
 ```bash
-# From the repo root
-ln -s ../skills .codex/skills
+npx @waynesutton/builder-skills install-all --target codex
 ```
 
-Or copy specific skills:
+or link instead of copy so updates flow through:
 
 ```bash
-mkdir -p .codex/skills
-cp -r skills/convex-best-practices .codex/skills/
-cp -r skills/convex-functions .codex/skills/
+npx @waynesutton/builder-skills install-all --target codex --link
 ```
 
-## Standard Agent Skills Path
-
-Some tools are standardizing on `.agents/skills`. You can mirror the repo skills there as well:
+## Global install
 
 ```bash
-# From the repo root
-ln -s ../skills .agents/skills
-```
-
-## Alternative: Install to CODEX_HOME
-
-For global access across all projects:
-
-```bash
-# Defaults to ~/.codex if CODEX_HOME is unset
+# CODEX_HOME defaults to ~/.codex
 cp -r skills/* "$CODEX_HOME/skills/"
 ```
 
-## Available Skills
+## Skills
 
-All skills in the `skills/` directory are available for Codex:
+Every folder in `skills/` is linked here. Each has `SKILL.md`, an `agents/openai.yaml` with icon metadata, and where needed a `references/` folder the skill loads on demand.
 
-- convex-best-practices
-- convex-functions
-- convex-realtime
-- convex-schema-validator
-- convex-file-storage
-- convex-agents
-- convex-cron-jobs
-- convex-http-actions
-- convex-migrations
-- convex-security-check
-- convex-security-audit
-- convex-component-authoring
-
-See the main [README](/README.md) for full documentation.
+See the main [README](../README.md) for the full list.

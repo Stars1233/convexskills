@@ -1,39 +1,43 @@
 {
-  "name": "@waynesutton/convex-skills",
-  "version": "1.0.9",
-  "description": "For official Convex Skills use Convex Agent Plugins at https://github.com/get-convex/convex-agent-plugins. This package provides unofficial agent skills for building production-ready Convex applications.",
-  "author": "Wayne Sutton - @waynesutton",
+  "name": "@waynesutton/builder-skills",
+  "version": "2.0.0",
+  "description": "Agent skills for builders shipping Convex apps. Convex patterns plus the PRD, task, changelog, and files.md workflow. Works with Claude Code, Codex, Cursor, OpenCode, and any agent that reads SKILL.md.",
+  "author": "Wayne Sutton <https://waynesutton.ai> (@waynesutton)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/waynesutton/convexskills.git"
+    "url": "git+https://github.com/waynesutton/builder-skills.git"
   },
-  "homepage": "https://github.com/waynesutton/convexskills#readme",
+  "homepage": "https://github.com/waynesutton/builder-skills#readme",
   "bugs": {
-    "url": "https://github.com/waynesutton/convexskills/issues"
+    "url": "https://github.com/waynesutton/builder-skills/issues"
   },
   "keywords": [
     "convex",
-    "convex-skills",
-    "ai-skills",
+    "builder-skills",
     "agent-skills",
-    "claude",
+    "skills",
+    "claude-code",
     "codex",
+    "cursor",
+    "opencode",
     "llm",
-    "ai-assistant",
-    "best-practices",
     "developer-tools",
-    "eslint",
-    "linting"
+    "prd",
+    "changelog",
+    "skills-sh"
   ],
   "type": "module",
   "main": "index.js",
   "bin": {
-    "convex-skills": "./bin/cli.js"
+    "builder-skills": "./bin/cli.js"
   },
   "files": [
+    ".claude-plugin/",
     "skills/**/*.md",
-    "templates/**/*.md",
+    "skills/**/agents/openai.yaml",
+    "skills/**/assets/*",
+    "templates/**/*",
     "AGENTS.md",
     "CLAUDE.md",
     "GEMINI.md",
@@ -41,8 +45,8 @@
     "bin/"
   ],
   "scripts": {
-    "prepublishOnly": "echo 'Publishing convex-skills to npm...'",
-    "postpublish": "echo 'Published successfully!'"
+    "check": "node scripts/check-skills.mjs",
+    "prepublishOnly": "node scripts/check-skills.mjs"
   },
   "engines": {
     "node": ">=18.0.0"

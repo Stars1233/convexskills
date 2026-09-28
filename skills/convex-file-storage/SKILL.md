@@ -1,409 +1,15 @@
 ---
 name: convex-file-storage
-displayName: Convex File Storage
-description: Complete file handling including upload flows, serving files via URL, storing generated files from actions, deletion, and accessing file metadata from system tables
-version: 1.0.0
-author: Convex
-tags: [convex, file-storage, uploads, images, files]
+description: Handles files in Convex: upload URLs, storing blobs from actions, serving with getUrl or an HTTP action, metadata from the _storage table, and deletion. Use when users upload images or documents, when an action fetches a file from a third party, or when a file URL expires unexpectedly.
 ---
 
-# Convex File Storage
+# Convex file storage
 
-Handle file uploads, storage, serving, and management in Convex applications with proper patterns for images, documents, and generated files.
+Produces the upload, store, serve, and delete functions for files in Convex. The one rule: persist the `Id<"_storage">`, never the URL string. URLs are resolved in queries with `ctx.storage.getUrl` at read time.
 
-## Documentation Sources
+## Schema
 
-Before implementing, do not assume; fetch the latest documentation:
-
-- Primary: https://docs.convex.dev/file-storage
-- Upload Files: https://docs.convex.dev/file-storage/upload-files
-- Serve Files: https://docs.convex.dev/file-storage/serve-files
-- For broader context: https://docs.convex.dev/llms.txt
-
-## Instructions
-
-### File Storage Overview
-
-Convex provides built-in file storage with:
-- Automatic URL generation for serving files
-- Support for any file type (images, PDFs, videos, etc.)
-- File metadata via the `_storage` system table
-- Integration with mutations and actions
-
-### Generating Upload URLs
-
-```typescript
-// convex/files.ts
-import { mutation } from "./_generated/server";
-import { v } from "convex/values";
-
-export const generateUploadUrl = mutation({
-  args: {},
-  returns: v.string(),
-  handler: async (ctx) => {
-    return await ctx.storage.generateUploadUrl();
-  },
-});
-```
-
-### Client-Side Upload
-
-```typescript
-// React component
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-import { useState } from "react";
-
-function FileUploader() {
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
-  const saveFile = useMutation(api.files.saveFile);
-  const [uploading, setUploading] = useState(false);
-
-  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setUploading(true);
-    try {
-      // Step 1: Get upload URL
-      const uploadUrl = await generateUploadUrl();
-
-      // Step 2: Upload file to storage
-      const result = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": file.type },
-        body: file,
-      });
-
-      const { storageId } = await result.json();
-
-      // Step 3: Save file reference to database
-      await saveFile({
-        storageId,
-        fileName: file.name,
-        fileType: file.type,
-        fileSize: file.size,
-      });
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  return (
-    <div>
-      <input
-        type="file"
-        onChange={handleUpload}
-        disabled={uploading}
-      />
-      {uploading && <p>Uploading...</p>}
-    </div>
-  );
-}
-```
-
-### Saving File References
-
-```typescript
-// convex/files.ts
-import { mutation, query } from "./_generated/server";
-import { v } from "convex/values";
-
-export const saveFile = mutation({
-  args: {
-    storageId: v.id("_storage"),
-    fileName: v.string(),
-    fileType: v.string(),
-    fileSize: v.number(),
-  },
-  returns: v.id("files"),
-  handler: async (ctx, args) => {
-    return await ctx.db.insert("files", {
-      storageId: args.storageId,
-      fileName: args.fileName,
-      fileType: args.fileType,
-      fileSize: args.fileSize,
-      uploadedAt: Date.now(),
-    });
-  },
-});
-```
-
-### Serving Files via URL
-
-```typescript
-// convex/files.ts
-export const getFileUrl = query({
-  args: { storageId: v.id("_storage") },
-  returns: v.union(v.string(), v.null()),
-  handler: async (ctx, args) => {
-    return await ctx.storage.getUrl(args.storageId);
-  },
-});
-
-// Get file with URL
-export const getFile = query({
-  args: { fileId: v.id("files") },
-  returns: v.union(
-    v.object({
-      _id: v.id("files"),
-      fileName: v.string(),
-      fileType: v.string(),
-      fileSize: v.number(),
-      url: v.union(v.string(), v.null()),
-    }),
-    v.null()
-  ),
-  handler: async (ctx, args) => {
-    const file = await ctx.db.get(args.fileId);
-    if (!file) return null;
-
-    const url = await ctx.storage.getUrl(file.storageId);
-    
-    return {
-      _id: file._id,
-      fileName: file.fileName,
-      fileType: file.fileType,
-      fileSize: file.fileSize,
-      url,
-    };
-  },
-});
-```
-
-### Displaying Files in React
-
-```typescript
-import { useQuery } from "convex/react";
-import { api } from "../convex/_generated/api";
-
-function FileDisplay({ fileId }: { fileId: Id<"files"> }) {
-  const file = useQuery(api.files.getFile, { fileId });
-
-  if (!file) return <div>Loading...</div>;
-  if (!file.url) return <div>File not found</div>;
-
-  // Handle different file types
-  if (file.fileType.startsWith("image/")) {
-    return <img src={file.url} alt={file.fileName} />;
-  }
-
-  if (file.fileType === "application/pdf") {
-    return (
-      <iframe
-        src={file.url}
-        title={file.fileName}
-        width="100%"
-        height="600px"
-      />
-    );
-  }
-
-  return (
-    <a href={file.url} download={file.fileName}>
-      Download {file.fileName}
-    </a>
-  );
-}
-```
-
-### Storing Generated Files from Actions
-
-```typescript
-// convex/generate.ts
-"use node";
-
-import { action } from "./_generated/server";
-import { v } from "convex/values";
-import { api } from "./_generated/api";
-
-export const generatePDF = action({
-  args: { content: v.string() },
-  returns: v.id("_storage"),
-  handler: async (ctx, args) => {
-    // Generate PDF (example using a library)
-    const pdfBuffer = await generatePDFFromContent(args.content);
-
-    // Convert to Blob
-    const blob = new Blob([pdfBuffer], { type: "application/pdf" });
-
-    // Store in Convex
-    const storageId = await ctx.storage.store(blob);
-
-    return storageId;
-  },
-});
-
-// Generate and save image
-export const generateImage = action({
-  args: { prompt: v.string() },
-  returns: v.id("_storage"),
-  handler: async (ctx, args) => {
-    // Call external API to generate image
-    const response = await fetch("https://api.example.com/generate", {
-      method: "POST",
-      body: JSON.stringify({ prompt: args.prompt }),
-    });
-
-    const imageBuffer = await response.arrayBuffer();
-    const blob = new Blob([imageBuffer], { type: "image/png" });
-
-    return await ctx.storage.store(blob);
-  },
-});
-```
-
-### Accessing File Metadata
-
-```typescript
-// convex/files.ts
-import { query } from "./_generated/server";
-import { v } from "convex/values";
-import { Id } from "./_generated/dataModel";
-
-type FileMetadata = {
-  _id: Id<"_storage">;
-  _creationTime: number;
-  contentType?: string;
-  sha256: string;
-  size: number;
-};
-
-export const getFileMetadata = query({
-  args: { storageId: v.id("_storage") },
-  returns: v.union(
-    v.object({
-      _id: v.id("_storage"),
-      _creationTime: v.number(),
-      contentType: v.optional(v.string()),
-      sha256: v.string(),
-      size: v.number(),
-    }),
-    v.null()
-  ),
-  handler: async (ctx, args) => {
-    const metadata = await ctx.db.system.get(args.storageId);
-    return metadata as FileMetadata | null;
-  },
-});
-```
-
-### Deleting Files
-
-```typescript
-// convex/files.ts
-import { mutation } from "./_generated/server";
-import { v } from "convex/values";
-
-export const deleteFile = mutation({
-  args: { fileId: v.id("files") },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    const file = await ctx.db.get(args.fileId);
-    if (!file) return null;
-
-    // Delete from storage
-    await ctx.storage.delete(file.storageId);
-
-    // Delete database record
-    await ctx.db.delete(args.fileId);
-
-    return null;
-  },
-});
-```
-
-### Image Upload with Preview
-
-```typescript
-import { useMutation } from "convex/react";
-import { api } from "../convex/_generated/api";
-import { useState, useRef } from "react";
-
-function ImageUploader({ onUpload }: { onUpload: (id: Id<"files">) => void }) {
-  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
-  const saveFile = useMutation(api.files.saveFile);
-  const [preview, setPreview] = useState<string | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    // Validate file type
-    if (!file.type.startsWith("image/")) {
-      alert("Please select an image file");
-      return;
-    }
-
-    // Validate file size (max 10MB)
-    if (file.size > 10 * 1024 * 1024) {
-      alert("File size must be less than 10MB");
-      return;
-    }
-
-    // Show preview
-    const reader = new FileReader();
-    reader.onload = (e) => setPreview(e.target?.result as string);
-    reader.readAsDataURL(file);
-
-    // Upload
-    setUploading(true);
-    try {
-      const uploadUrl = await generateUploadUrl();
-      const result = await fetch(uploadUrl, {
-        method: "POST",
-        headers: { "Content-Type": file.type },
-        body: file,
-      });
-
-      const { storageId } = await result.json();
-      const fileId = await saveFile({
-        storageId,
-        fileName: file.name,
-        fileType: file.type,
-        fileSize: file.size,
-      });
-
-      onUpload(fileId);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  return (
-    <div>
-      <input
-        ref={inputRef}
-        type="file"
-        accept="image/*"
-        onChange={handleFileSelect}
-        style={{ display: "none" }}
-      />
-      
-      <button
-        onClick={() => inputRef.current?.click()}
-        disabled={uploading}
-      >
-        {uploading ? "Uploading..." : "Select Image"}
-      </button>
-
-      {preview && (
-        <img
-          src={preview}
-          alt="Preview"
-          style={{ maxWidth: 200, marginTop: 10 }}
-        />
-      )}
-    </div>
-  );
-}
-```
-
-## Examples
-
-### Schema for File Storage
+Keep your own table for app metadata (name, owner, purpose) and point at `_storage` by id. Convex keeps size, content type, and hash in the `_storage` system table.
 
 ```typescript
 // convex/schema.ts
@@ -413,55 +19,261 @@ import { v } from "convex/values";
 export default defineSchema({
   files: defineTable({
     storageId: v.id("_storage"),
-    fileName: v.string(),
-    fileType: v.string(),
-    fileSize: v.number(),
-    uploadedBy: v.id("users"),
-    uploadedAt: v.number(),
-  })
-    .index("by_user", ["uploadedBy"])
-    .index("by_type", ["fileType"]),
-
-  // User avatars
-  users: defineTable({
     name: v.string(),
-    email: v.string(),
-    avatarStorageId: v.optional(v.id("_storage")),
-  }),
-
-  // Posts with images
-  posts: defineTable({
-    authorId: v.id("users"),
-    content: v.string(),
-    imageStorageIds: v.array(v.id("_storage")),
-    createdAt: v.number(),
-  }).index("by_author", ["authorId"]),
+    contentType: v.string(),
+    size: v.number(),
+    ownerId: v.id("users"),
+  }).index("by_owner", ["ownerId"]),
 });
 ```
 
-## Best Practices
+## Upload flow
 
-- Never run `npx convex deploy` unless explicitly instructed
-- Never run any git commands unless explicitly instructed
-- Validate file types and sizes on the client before uploading
-- Store file metadata (name, type, size) in your own table
-- Use the `_storage` system table only for Convex metadata
-- Delete storage files when deleting database references
-- Use appropriate Content-Type headers when uploading
-- Consider image optimization for large images
+Three steps: a mutation hands out a short lived upload URL, the client POSTs the file to it, then a second mutation saves the returned `storageId`. Upload URLs expire after one hour, so generate a fresh one per upload and never store it.
 
-## Common Pitfalls
+```typescript
+// convex/files.ts
+import { mutation, query } from "./_generated/server";
+import { v } from "convex/values";
+import { getCurrentUser } from "./lib/auth";
 
-1. **Not setting Content-Type header** - Files may not serve correctly
-2. **Forgetting to delete storage** - Orphaned files waste storage
-3. **Not validating file types** - Security risk for malicious uploads
-4. **Large file uploads without progress** - Poor UX for users
-5. **Using deprecated getMetadata** - Use ctx.db.system.get instead
+const MAX_BYTES = 10 * 1024 * 1024;
+const ALLOWED_TYPES = ["image/png", "image/jpeg", "image/webp", "application/pdf"];
 
-## References
+export const generateUploadUrl = mutation({
+  args: {},
+  returns: v.string(),
+  handler: async (ctx) => {
+    await getCurrentUser(ctx); // only signed in users get an upload slot
+    return await ctx.storage.generateUploadUrl();
+  },
+});
 
-- Convex Documentation: https://docs.convex.dev/
-- Convex LLMs.txt: https://docs.convex.dev/llms.txt
-- File Storage: https://docs.convex.dev/file-storage
-- Upload Files: https://docs.convex.dev/file-storage/upload-files
-- Serve Files: https://docs.convex.dev/file-storage/serve-files
+export const saveFile = mutation({
+  args: { storageId: v.id("_storage"), name: v.string() },
+  returns: v.id("files"),
+  handler: async (ctx, args) => {
+    const user = await getCurrentUser(ctx);
+
+    // Server side validation reads the real size and type from _storage.
+    // Client checks are for UX only; anyone can POST to the upload URL.
+    const meta = await ctx.db.system.get(args.storageId);
+    if (!meta) throw new Error("Upload not found");
+    if (meta.size > MAX_BYTES || !ALLOWED_TYPES.includes(meta.contentType ?? "")) {
+      await ctx.storage.delete(args.storageId);
+      throw new Error("File type or size not allowed");
+    }
+
+    return await ctx.db.insert("files", {
+      storageId: args.storageId,
+      name: args.name,
+      contentType: meta.contentType ?? "application/octet-stream",
+      size: meta.size,
+      ownerId: user._id,
+    });
+  },
+});
+```
+
+```tsx
+// src/FileUploader.tsx
+import { useMutation } from "convex/react";
+import { api } from "../convex/_generated/api";
+import { Id } from "../convex/_generated/dataModel";
+import { useState } from "react";
+
+const MAX_BYTES = 10 * 1024 * 1024;
+
+export function FileUploader() {
+  const generateUploadUrl = useMutation(api.files.generateUploadUrl);
+  const saveFile = useMutation(api.files.saveFile);
+  const [status, setStatus] = useState<"idle" | "uploading" | "error">("idle");
+
+  async function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_BYTES) return setStatus("error");
+
+    setStatus("uploading");
+    try {
+      const uploadUrl = await generateUploadUrl();
+      const res = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": file.type }, // recorded as the file's contentType
+        body: file,
+      });
+      if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+      const { storageId } = (await res.json()) as { storageId: Id<"_storage"> };
+      await saveFile({ storageId, name: file.name });
+      setStatus("idle");
+    } catch {
+      setStatus("error");
+    }
+  }
+
+  return <input type="file" accept="image/*,.pdf" onChange={handleChange} disabled={status === "uploading"} />;
+}
+```
+
+## Storing a blob from an action
+
+`ctx.storage.store` is available in actions and HTTP actions, not in mutations. Plain `fetch` works in the default runtime, so `"use node"` is only needed when a Node library produces the bytes. When building bytes yourself, wrap them first: `new Blob([bytes], { type: "application/pdf" })`. Without a `type` the file serves as `application/octet-stream`.
+
+```typescript
+// convex/importFile.ts
+import { action } from "./_generated/server";
+import { internal } from "./_generated/api";
+import { v } from "convex/values";
+
+export const importFromUrl = action({
+  args: { url: v.string(), name: v.string(), ownerId: v.id("users") },
+  returns: v.id("files"),
+  handler: async (ctx, args) => {
+    const response = await fetch(args.url);
+    if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+
+    // response.blob() carries the Content-Type header into blob.type
+    const blob = await response.blob();
+    const storageId = await ctx.storage.store(blob);
+
+    return await ctx.runMutation(internal.files.saveImported, {
+      storageId,
+      name: args.name,
+      ownerId: args.ownerId,
+    });
+  },
+});
+```
+
+## Serving with getUrl
+
+Resolve the URL inside the query that returns the file. The client renders `url` directly in `img`, `iframe`, or a download link.
+
+```typescript
+// convex/files.ts
+export const listMine = query({
+  args: {},
+  returns: v.array(
+    v.object({
+      _id: v.id("files"),
+      name: v.string(),
+      contentType: v.string(),
+      size: v.number(),
+      url: v.union(v.string(), v.null()),
+    }),
+  ),
+  handler: async (ctx) => {
+    const user = await getCurrentUser(ctx);
+    const files = await ctx.db
+      .query("files")
+      .withIndex("by_owner", (q) => q.eq("ownerId", user._id))
+      .order("desc")
+      .collect();
+    return await Promise.all(
+      files.map(async (f) => ({
+        _id: f._id,
+        name: f.name,
+        contentType: f.contentType,
+        size: f.size,
+        url: await ctx.storage.getUrl(f.storageId),
+      })),
+    );
+  },
+});
+```
+
+`getUrl` returns `null` when the file was deleted. Handle that in the UI instead of assuming a string.
+
+## Serving through an HTTP action
+
+Use this when the file needs an auth check, a custom `Content-Disposition`, or a stable path at `https://<deployment>.convex.site/files/<storageId>`. `ctx.storage.get` returns the `Blob`. Add the route to the router in `convex/http.ts`.
+
+```typescript
+// convex/http.ts
+import { Id } from "./_generated/dataModel";
+
+http.route({
+  pathPrefix: "/files/",
+  method: "GET",
+  handler: httpAction(async (ctx, request) => {
+    const storageId = new URL(request.url).pathname.slice("/files/".length) as Id<"_storage">;
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) return new Response("Unauthorized", { status: 401 });
+
+    const blob = await ctx.storage.get(storageId);
+    if (!blob) return new Response("Not found", { status: 404 });
+    return new Response(blob, {
+      headers: { "Content-Type": blob.type || "application/octet-stream" },
+    });
+  }),
+});
+```
+
+## Metadata from the _storage table
+
+Read metadata with `ctx.db.system.get(storageId)` in any query or mutation, as `saveFile` does above. `ctx.storage.getMetadata` is deprecated and should not appear in new code. The document shape:
+
+```typescript
+type StorageDoc = {
+  _id: Id<"_storage">;
+  _creationTime: number;
+  contentType?: string; // from the upload's Content-Type header or blob.type
+  sha256: string;
+  size: number; // bytes
+};
+```
+
+The matching validator is `v.object({ _id: v.id("_storage"), _creationTime: v.number(), contentType: v.optional(v.string()), sha256: v.string(), size: v.number() })`. `ctx.db.system.query("_storage")` lists every stored file, useful for finding orphans that no `files` row points to.
+
+## Deleting
+
+Delete the blob and the row in the same mutation so neither is orphaned. Check ownership on the row, not by trusting the client. If several rows can share one `storageId`, only delete the blob when the last reference goes.
+
+```typescript
+// convex/files.ts
+export const remove = mutation({
+  args: { fileId: v.id("files") },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const user = await getCurrentUser(ctx);
+    const file = await ctx.db.get(args.fileId);
+    if (!file) return null; // idempotent: already gone
+    if (file.ownerId !== user._id) throw new Error("Not allowed");
+
+    await ctx.storage.delete(file.storageId);
+    await ctx.db.delete(args.fileId);
+    return null;
+  },
+});
+```
+
+## Common mistakes
+
+| Mistake | Why it breaks | Do instead |
+| --- | --- | --- |
+| Saving the URL from `getUrl` or the upload URL in a document | Upload URLs expire in an hour; stored URLs go stale after deletes | Store `Id<"_storage">`, resolve with `getUrl` in the query |
+| `v.string()` for the storage id | Loses type safety, accepts garbage | `v.id("_storage")` |
+| Calling `ctx.storage.store` in a mutation | Not available there | Use an action or HTTP action, then `runMutation` to save |
+| Skipping `Content-Type` on the upload POST | File serves as `application/octet-stream`, images will not render inline | Set `headers: { "Content-Type": file.type }` |
+| Validating size and type only in the browser | Anyone can POST to the upload URL directly | Check again with `ctx.db.system.get` in the save mutation |
+| `ctx.storage.getMetadata(id)` | Deprecated | `ctx.db.system.get(id)` |
+| Deleting the `files` row but not the blob | Storage bill keeps growing | Delete both in one mutation |
+| Uploading large files through an HTTP action | 20MB request cap | Use the upload URL flow |
+
+## Checklist
+
+- [ ] Schema stores `v.id("_storage")` plus app level name, type, size, and owner
+- [ ] `generateUploadUrl` requires a signed in user, and the client POSTs with `Content-Type: file.type`
+- [ ] Save mutation validates size and content type again via `ctx.db.system.get` and deletes rejected uploads
+- [ ] Queries return `url` from `ctx.storage.getUrl` and the UI handles `null`
+- [ ] Actions use `ctx.storage.store(blob)` with a correct `type`, then `runMutation` to save the reference
+- [ ] HTTP serving route checks auth before `ctx.storage.get`
+- [ ] Delete mutation removes the blob and the row together and is idempotent
+- [ ] No `ctx.storage.getMetadata` calls and no URL strings persisted in the database
+
+## Docs
+
+- https://docs.convex.dev/llms.txt
+- https://docs.convex.dev/file-storage/upload-files
+- https://docs.convex.dev/file-storage/serve-files
+- https://docs.convex.dev/file-storage/file-metadata

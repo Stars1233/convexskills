@@ -1,15 +1,18 @@
-# Development files
+# Development and agent config
 .cursor/
 .claude/
 .claude-plugin/
 .opencode/
+.codex/
+.agents/
 prds/
+scripts/
 
 # Git
 .git/
 .gitignore
 
-# Documentation (not needed in package)
+# Repo docs that do not belong in the package
 docs.md
 files.md
 task.md
@@ -18,4 +21,5 @@ CONTRIBUTING.md
 
 # Local files
 *.log
+.DS_Store
 node_modules/

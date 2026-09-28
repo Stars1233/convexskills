@@ -1,378 +1,176 @@
 ---
 name: convex-security-check
-displayName: Convex Security Check
-description: Quick security audit checklist covering authentication, function exposure, argument validation, row-level access control, and environment variable handling
-version: 1.0.0
-author: Convex
-tags: [convex, security, authentication, authorization, checklist]
+description: Ten minute security pass over a Convex backend: public functions that should be internal, missing auth checks, unvalidated args, IDs from the client trusted without ownership checks, secrets in code. Use before merging a pull request, after adding new public functions, or when the user says 'quick security check'.
 ---
 
-# Convex Security Check
+# Convex security check
 
-A quick security audit checklist for Convex applications covering authentication, function exposure, argument validation, row-level access control, and environment variable handling.
+A ten minute pass over `convex/` that catches the mistakes that ship most often. The one rule: every exported `query`, `mutation`, and `action` is a public endpoint anyone can call with any arguments, so each one must check identity and ownership or be intentionally anonymous.
 
-## Documentation Sources
+Run each grep, read what it surfaces, fix or file. This skill finds problems; it does not map the whole system. For that, hand off to convex-security-audit.
 
-Before implementing, do not assume; fetch the latest documentation:
+## When to reach for this
 
-- Primary: https://docs.convex.dev/auth
-- Production Security: https://docs.convex.dev/production
-- Functions Auth: https://docs.convex.dev/auth/functions-auth
-- For broader context: https://docs.convex.dev/llms.txt
+- Before merging a pull request that touches `convex/`
+- After adding or renaming public functions
+- The user says "quick security check", "sanity check the backend", or "anything obviously wrong here"
+- Before a dev to prod push, when there is no time for a full audit
 
-## Instructions
+## Checklist
 
-### Security Checklist
+Run the commands from the project root. Every grep excludes `_generated`.
 
-Use this checklist to quickly audit your Convex application's security:
+### 1. Public vs internal
 
-#### 1. Authentication
+Anything only called by other Convex functions, the scheduler, crons, or webhooks should be `internalQuery`, `internalMutation`, or `internalAction`.
 
-- [ ] Authentication provider configured (Clerk, Auth0, etc.)
-- [ ] All sensitive queries check `ctx.auth.getUserIdentity()`
-- [ ] Unauthenticated access explicitly allowed where intended
-- [ ] Session tokens properly validated
-
-#### 2. Function Exposure
-
-- [ ] Public functions (`query`, `mutation`, `action`) reviewed
-- [ ] Internal functions use `internalQuery`, `internalMutation`, `internalAction`
-- [ ] No sensitive operations exposed as public functions
-- [ ] HTTP actions validate origin/authentication
-
-#### 3. Argument Validation
-
-- [ ] All functions have explicit `args` validators
-- [ ] All functions have explicit `returns` validators
-- [ ] No `v.any()` used for sensitive data
-- [ ] ID validators use correct table names
-
-#### 4. Row-Level Access Control
-
-- [ ] Users can only access their own data
-- [ ] Admin functions check user roles
-- [ ] Shared resources have proper access checks
-- [ ] Deletion functions verify ownership
-
-#### 5. Environment Variables
-
-- [ ] API keys stored in environment variables
-- [ ] No secrets in code or schema
-- [ ] Different keys for dev/prod environments
-- [ ] Environment variables accessed only in actions
-
-### Authentication Check
-
-```typescript
-// convex/auth.ts
-import { query, mutation } from "./_generated/server";
-import { v } from "convex/values";
-import { ConvexError } from "convex/values";
-
-// Helper to require authentication
-async function requireAuth(ctx: QueryCtx | MutationCtx) {
-  const identity = await ctx.auth.getUserIdentity();
-  if (!identity) {
-    throw new ConvexError("Authentication required");
-  }
-  return identity;
-}
-
-// Secure query pattern
-export const getMyProfile = query({
-  args: {},
-  returns: v.union(v.object({
-    _id: v.id("users"),
-    name: v.string(),
-    email: v.string(),
-  }), v.null()),
-  handler: async (ctx) => {
-    const identity = await requireAuth(ctx);
-    
-    return await ctx.db
-      .query("users")
-      .withIndex("by_tokenIdentifier", (q) => 
-        q.eq("tokenIdentifier", identity.tokenIdentifier)
-      )
-      .unique();
-  },
-});
+```bash
+rg -n "export const \w+ = (query|mutation|action)\(" convex --glob '!**/_generated/**'
+rg -n "\bapi\.\w+\.\w+" convex --glob '!**/_generated/**'
 ```
 
-### Function Exposure Check
+The second grep finds `api.*` used inside the backend. Server code scheduling or running a public function is almost always a sign that function should be internal.
 
-```typescript
-// PUBLIC - Exposed to clients (review carefully!)
-export const listPublicPosts = query({
-  args: {},
-  returns: v.array(v.object({ /* ... */ })),
-  handler: async (ctx) => {
-    // Anyone can call this - intentionally public
-    return await ctx.db
-      .query("posts")
-      .withIndex("by_public", (q) => q.eq("isPublic", true))
-      .collect();
-  },
-});
+- [ ] Every public function has a client that needs to call it
+- [ ] No `api.*` inside `ctx.scheduler.*`, `ctx.run*`, or `crons.*`
+- [ ] Admin only operations (role changes, credit grants, deletions across users) are internal
 
-// INTERNAL - Only callable from other Convex functions
-export const _updateUserCredits = internalMutation({
-  args: { userId: v.id("users"), amount: v.number() },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    // This cannot be called directly from clients
-    await ctx.db.patch(args.userId, {
-      credits: args.amount,
-    });
-    return null;
-  },
-});
+### 2. Auth
+
+```bash
+rg -l "= (query|mutation|action)\(" convex --glob '!**/_generated/**' \
+  | xargs rg -L "getUserIdentity|getCurrentUser|authedQuery|authedMutation"
 ```
 
-### Argument Validation Check
+Files listed contain public functions and no auth call at all. Open each one. A public post list is fine anonymous. Anything that returns or writes user data is not.
 
-```typescript
-// GOOD: Strict validation
-export const createPost = mutation({
-  args: {
-    title: v.string(),
-    content: v.string(),
-    category: v.union(
-      v.literal("tech"),
-      v.literal("news"),
-      v.literal("other")
-    ),
-  },
-  returns: v.id("posts"),
-  handler: async (ctx, args) => {
-    const identity = await requireAuth(ctx);
-    return await ctx.db.insert("posts", {
-      ...args,
-      authorId: identity.tokenIdentifier,
-    });
-  },
-});
+- [ ] Every public function checks identity or is documented as intentionally anonymous
+- [ ] Auth helpers throw or return early when identity is missing
+- [ ] Roles come from the `users` table, never from client arguments
 
-// BAD: Weak validation
-export const createPostUnsafe = mutation({
-  args: {
-    data: v.any(), // DANGEROUS: Allows any data
-  },
-  returns: v.id("posts"),
-  handler: async (ctx, args) => {
-    return await ctx.db.insert("posts", args.data);
-  },
-});
+### 3. Validation
+
+```bash
+rg -nU "(query|mutation|action)\(\{\s*handler" convex --glob '!**/_generated/**'
+rg -n "v\.any\(\)" convex --glob '!**/_generated/**'
 ```
 
-### Row-Level Access Control Check
+The first grep finds functions whose definition starts with `handler`, meaning no `args`. The second finds `v.any()`, which turns off validation for that field.
+
+- [ ] Every function has `args` and `returns` validators
+- [ ] No `v.any()` on arguments that reach the database or an external API
+- [ ] Return validators list fields explicitly so `passwordHash`, `stripeCustomerId`, and internal flags cannot leak
+
+### 4. Ownership and IDs
+
+`v.id("tasks")` proves the string is a valid ID for that table. It does not prove the caller owns the document.
+
+```bash
+rg -n "ctx\.db\.(get|patch|delete|replace)\(args\." convex --glob '!**/_generated/**'
+rg -n "userId: v\.(id|string)\(" convex --glob '!**/_generated/**'
+```
+
+For each hit in the first grep, find the ownership comparison between the read and the write. For the second, a public function that accepts the caller's own `userId` as an argument is trusting the client to say who it is.
+
+- [ ] Every `get`, `patch`, `delete`, `replace` by a client supplied ID is followed by an ownership or membership check
+- [ ] Caller identity is derived from `ctx.auth`, never accepted as an argument
+- [ ] Lists use `withIndex` on the owner field, not a full scan plus filter
+
+### 5. Secrets
+
+```bash
+rg -n -i "(sk_live|sk_test|whsec_|AKIA[0-9A-Z]{16}|-----BEGIN|api[_-]?key\s*[:=]\s*['\"][A-Za-z0-9])" convex src --glob '!**/_generated/**'
+rg -n "process\.env\." src
+```
+
+Anything in `src/` that reads `process.env` or `import.meta.env` ships to the browser. Only deployment URLs and public client IDs belong there.
+
+- [ ] No secret literals in `convex/`, `src/`, tests, or fixtures
+- [ ] Secrets read from `process.env` inside the action or HTTP action that uses them
+- [ ] Dev and prod deployments use different keys
+
+### 6. HTTP and storage
+
+```bash
+rg -n "http\.route|httpAction\(" convex/http.ts
+rg -n "storage\.(generateUploadUrl|getUrl)" convex --glob '!**/_generated/**'
+```
+
+- [ ] Every `http.ts` route verifies its caller (webhook signature, bearer token, or `getUserIdentity`) before parsing the body
+- [ ] Routes call `internal.*`, not `api.*`
+- [ ] `generateUploadUrl` requires auth
+- [ ] `getUrl` is called on a storage ID read from a document the caller owns, never on a storage ID passed by the client
+
+## One fix, before and after
+
+The most common finding: auth is checked, ownership is not.
+
+Before:
 
 ```typescript
-// Verify ownership before update
 export const updateTask = mutation({
-  args: {
-    taskId: v.id("tasks"),
-    title: v.string(),
-  },
+  args: { taskId: v.id("tasks"), title: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const identity = await requireAuth(ctx);
-    
-    const task = await ctx.db.get(args.taskId);
-    
-    // Check ownership
-    if (!task || task.userId !== identity.tokenIdentifier) {
-      throw new ConvexError("Not authorized to update this task");
-    }
-    
+    const identity = await ctx.auth.getUserIdentity();
+    if (!identity) throw new ConvexError("Sign in required");
+    // any signed in user can rename any task
     await ctx.db.patch(args.taskId, { title: args.title });
     return null;
   },
 });
+```
 
-// Verify ownership before delete
-export const deleteTask = mutation({
-  args: { taskId: v.id("tasks") },
+After:
+
+```typescript
+import { mutation } from "./_generated/server";
+import { v, ConvexError } from "convex/values";
+import { getCurrentUser } from "./lib/auth";
+
+export const updateTask = mutation({
+  args: { taskId: v.id("tasks"), title: v.string() },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const identity = await requireAuth(ctx);
-    
+    const user = await getCurrentUser(ctx); // throws when signed out
     const task = await ctx.db.get(args.taskId);
-    
-    if (!task || task.userId !== identity.tokenIdentifier) {
-      throw new ConvexError("Not authorized to delete this task");
+    // same error for missing and not owned, so IDs cannot be probed
+    if (!task || task.userId !== user._id) {
+      throw new ConvexError({ code: "NOT_FOUND", message: "Task not found" });
     }
-    
-    await ctx.db.delete(args.taskId);
+    await ctx.db.patch(args.taskId, { title: args.title });
     return null;
   },
 });
 ```
 
-### Environment Variables Check
+`getCurrentUser` looks the user up through a `by_tokenIdentifier` index using `identity.tokenIdentifier` and throws when there is no identity. Define it once in `convex/lib/auth.ts` and use it everywhere.
 
-```typescript
-// convex/actions.ts
-"use node";
+## Common mistakes
 
-import { action } from "./_generated/server";
-import { v } from "convex/values";
+| Mistake | Why it breaks | Do this instead |
+| --- | --- | --- |
+| Checking auth in the React component only | Anyone can call the function from the dashboard or a script | Check in the handler |
+| `v.id("users")` argument for "the current user" | Client can pass any user's ID | Derive from `ctx.auth.getUserIdentity()` |
+| Comparing ownership to `identity.email` | Emails can be reused or unverified | Compare to `user._id` |
+| `internalMutation` treated as safe on its own | The public caller may pass unverified IDs | Check the call site too |
+| Fixing one hit and moving on | The same pattern usually appears in siblings | Fix all hits from the grep |
 
-export const sendEmail = action({
-  args: {
-    to: v.string(),
-    subject: v.string(),
-    body: v.string(),
-  },
-  returns: v.object({ success: v.boolean() }),
-  handler: async (ctx, args) => {
-    // Access API key from environment
-    const apiKey = process.env.RESEND_API_KEY;
-    
-    if (!apiKey) {
-      throw new Error("RESEND_API_KEY not configured");
-    }
-    
-    const response = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: "noreply@example.com",
-        to: args.to,
-        subject: args.subject,
-        html: args.body,
-      }),
-    });
-    
-    return { success: response.ok };
-  },
-});
-```
+## Hand off to convex-security-audit
 
-## Examples
+Stop and run the full audit when any of these are true:
 
-### Complete Security Pattern
+- More than two or three findings in steps 2 or 4; the pattern is systemic
+- The app has multi tenant data (orgs, teams, workspaces)
+- `http.ts` has webhook routes or routes that return user data
+- Files are uploaded and served
+- The user asks for a report, a launch review, or a post incident review
 
-```typescript
-// convex/secure.ts
-import { query, mutation, internalMutation } from "./_generated/server";
-import { v } from "convex/values";
-import { ConvexError } from "convex/values";
+The audit maps auth per function, data access per table, HTTP exposure, storage, scheduler trust, rate limiting, and produces a written findings report. This check does not.
 
-// Authentication helper
-async function getAuthenticatedUser(ctx: QueryCtx | MutationCtx) {
-  const identity = await ctx.auth.getUserIdentity();
-  if (!identity) {
-    throw new ConvexError({
-      code: "UNAUTHENTICATED",
-      message: "You must be logged in",
-    });
-  }
-  
-  const user = await ctx.db
-    .query("users")
-    .withIndex("by_tokenIdentifier", (q) => 
-      q.eq("tokenIdentifier", identity.tokenIdentifier)
-    )
-    .unique();
-    
-  if (!user) {
-    throw new ConvexError({
-      code: "USER_NOT_FOUND",
-      message: "User profile not found",
-    });
-  }
-  
-  return user;
-}
+## Docs
 
-// Check admin role
-async function requireAdmin(ctx: QueryCtx | MutationCtx) {
-  const user = await getAuthenticatedUser(ctx);
-  
-  if (user.role !== "admin") {
-    throw new ConvexError({
-      code: "FORBIDDEN",
-      message: "Admin access required",
-    });
-  }
-  
-  return user;
-}
-
-// Public: List own tasks
-export const listMyTasks = query({
-  args: {},
-  returns: v.array(v.object({
-    _id: v.id("tasks"),
-    title: v.string(),
-    completed: v.boolean(),
-  })),
-  handler: async (ctx) => {
-    const user = await getAuthenticatedUser(ctx);
-    
-    return await ctx.db
-      .query("tasks")
-      .withIndex("by_user", (q) => q.eq("userId", user._id))
-      .collect();
-  },
-});
-
-// Admin only: List all users
-export const listAllUsers = query({
-  args: {},
-  returns: v.array(v.object({
-    _id: v.id("users"),
-    name: v.string(),
-    role: v.string(),
-  })),
-  handler: async (ctx) => {
-    await requireAdmin(ctx);
-    
-    return await ctx.db.query("users").collect();
-  },
-});
-
-// Internal: Update user role (never exposed)
-export const _setUserRole = internalMutation({
-  args: {
-    userId: v.id("users"),
-    role: v.union(v.literal("user"), v.literal("admin")),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    await ctx.db.patch(args.userId, { role: args.role });
-    return null;
-  },
-});
-```
-
-## Best Practices
-
-- Never run `npx convex deploy` unless explicitly instructed
-- Never run any git commands unless explicitly instructed
-- Always verify user identity before returning sensitive data
-- Use internal functions for sensitive operations
-- Validate all arguments with strict validators
-- Check ownership before update/delete operations
-- Store API keys in environment variables
-- Review all public functions for security implications
-
-## Common Pitfalls
-
-1. **Missing authentication checks** - Always verify identity
-2. **Exposing internal operations** - Use internalMutation/Query
-3. **Trusting client-provided IDs** - Verify ownership
-4. **Using v.any() for arguments** - Use specific validators
-5. **Hardcoding secrets** - Use environment variables
-
-## References
-
-- Convex Documentation: https://docs.convex.dev/
-- Convex LLMs.txt: https://docs.convex.dev/llms.txt
-- Authentication: https://docs.convex.dev/auth
-- Production Security: https://docs.convex.dev/production
-- Functions Auth: https://docs.convex.dev/auth/functions-auth
+- https://docs.convex.dev/llms.txt
+- https://docs.convex.dev/auth/functions-auth
+- https://docs.convex.dev/functions/internal-functions
+- https://docs.convex.dev/functions/validation

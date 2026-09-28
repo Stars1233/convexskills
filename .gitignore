@@ -1,9 +1,6 @@
 # Dependencies
 node_modules/
 
-# PRDs and internal planning docs
-prds/
-
 # Build output
 dist/
 build/
@@ -22,13 +19,12 @@ Thumbs.db
 *.swp
 *.swo
 
-# Local config folders (not tracked)
+# Local agent config folders. These are per machine and tool specific.
+# .codex/ stays tracked because it holds symlinks that make Codex find skills/.
 .claude/
 .cursor/
 .opencode/
-
-# Local task tracking
-task.md
+.agents/
 
 # Logs
 *.log
